@@ -1,22 +1,37 @@
-# Active Providers (Change these to switch services)
+# ============================================================
+# Production voicebot configuration
+# ============================================================
+
 active_providers:
-  stt: "deepgram"
-  llm: "groq"
-  tts: "elevenlabs"
-
-
-# PROVIDER REGISTRY
-# Add ANY provider here without touching Python code
-# The ServiceFactory in bot.py reads this registry and dynamically imports the correct class
+  stt: "sarvam"
+  llm: "sarvam"
+  tts: "murf"
 
 providers:
-  # STT PROVIDERS
+
+  # ------------------------------------------------------------
+  # STT
+  # ------------------------------------------------------------
   stt:
+    sarvam:
+      class_path: "pipecat.services.sarvam.stt.SarvamSTTService"
+      api_key_env: "SARVAM_API_KEY"
+      params:
+        model: "saaras:v3"
+        language: "unknown"
+        mode: "codemix"
+        sample_rate: 8000
+        input_audio_codec: "pcm_s16le"
+        keepalive_timeout: 10
+        keepalive_interval: 5
+
     deepgram:
       class_path: "pipecat.services.deepgram.stt.DeepgramSTTService"
       api_key_env: "DEEPGRAM_API_KEY"
       params:
         model: "nova-2"
+        language: "en"
+        smart_format: true
         sample_rate: 8000
         encoding: "linear16"
         channels: 1
@@ -27,31 +42,42 @@ providers:
       params:
         model: "whisper-1"
 
-    parakeet:
-      class_path: "pipecat.services.nvidia.stt.NvidiaSTTService"
-      api_key_env: "NVIDIA_API_KEY"
-      params:
-        model_function_map:
-          function_id: "d8dd4e9b-fbf5-4fb0-9dba-8cf436c8d965"
-          model_name: "parakeet-ctc-0.6b-asr"
-
-
-  # LLM PROVIDERS
+  # ------------------------------------------------------------
+  # LLM
+  # ------------------------------------------------------------
   llm:
-    cerebras:
+    sarvam:
       class_path: "pipecat.services.openai.llm.OpenAILLMService"
-      api_key_env: "CEREBRAS_API_KEY"
+      api_key_env: "SARVAM_API_KEY"
       params:
-        model: "gpt-oss-120b"
-        base_url: "https://api.cerebras.ai/v1"
+        model: "sarvam-105b-conversations"
+        base_url: "https://api.sarvam.ai/v1"
+        temperature: 0.2
+        max_completion_tokens: 160
         tools:
           - type: "function"
             function:
               name: "end_call"
-              description: "End the call immediately when the conversation is over."
+              description: "End the call when the conversation is complete, the caller is not interested, or the caller clearly wants to end the call."
               parameters:
                 type: "object"
                 properties: {}
+                additionalProperties: false
+
+          - type: "function"
+            function:
+              name: "set_conversation_language"
+              description: "Change the language spoken by the agent. Use only when the caller explicitly requests another supported language or clearly changes their conversational language. Do not use this for ordinary code-switching or isolated words."
+              parameters:
+                type: "object"
+                properties:
+                  language:
+                    type: "string"
+                    enum: ["en", "hi", "te"]
+                  reason:
+                    type: "string"
+                required: ["language", "reason"]
+                additionalProperties: false
 
     groq:
       class_path: "pipecat.services.openai.llm.OpenAILLMService"
@@ -59,555 +85,216 @@ providers:
       params:
         model: "llama-3.1-8b-instant"
         base_url: "https://api.groq.com/openai/v1"
+        temperature: 0.2
+        max_completion_tokens: 160
         tools:
           - type: "function"
             function:
               name: "end_call"
-              description: "End the call immediately when the conversation is over."
+              description: "End the call when the conversation is complete, the caller is not interested, or the caller clearly wants to end the call."
               parameters:
                 type: "object"
-                properties: {} 
+                properties: {}
+                additionalProperties: false
 
+          - type: "function"
+            function:
+              name: "set_conversation_language"
+              description: "Change the language spoken by the agent. Use only when the caller explicitly requests another supported language or clearly changes their conversational language. Do not use this for ordinary code-switching or isolated words."
+              parameters:
+                type: "object"
+                properties:
+                  language:
+                    type: "string"
+                    enum: ["en", "hi", "te"]
+                  reason:
+                    type: "string"
+                required: ["language", "reason"]
+                additionalProperties: false
 
-  # TTS PROVIDERS
+    cerebras:
+      class_path: "pipecat.services.openai.llm.OpenAILLMService"
+      api_key_env: "CEREBRAS_API_KEY"
+      params:
+        model: "gpt-oss-120b"
+        base_url: "https://api.cerebras.ai/v1"
+        temperature: 0.2
+        max_completion_tokens: 160
+
+  # ------------------------------------------------------------
+  # TTS
+  # ------------------------------------------------------------
   tts:
+    murf:
+      class_path: "services.murf_http.MurfFalcon2TTSService"
+      api_key_env: "MURF_API_KEY"
+      _needs_aiohttp: true
+      params:
+        model: "falcon-2"
+        voice_id: "Anisha"
+        locale: "en-IN"
+        base_url: "https://in.api.murf.ai"
+        sample_rate: 8000
+        channel_type: "MONO"
+        format: "PCM"
+        request_timeout_seconds: 30
+
+    sarvam:
+      class_path: "pipecat.services.sarvam.tts.SarvamTTSService"
+      api_key_env: "SARVAM_API_KEY"
+      params:
+        model: "bulbul:v3"
+        voice_id: "anushka"
+        language: "en-IN"
+        sample_rate: 8000
+
+    elevenlabs:
+      class_path: "services.elevenlabs_http.HttpElevenLabsTTSService"
+      api_key_env: "ELEVENLABS_API_KEY"
+      params:
+        voice_id: "REPLACE_WITH_TESTED_MULTILINGUAL_VOICE"
+
     deepgram:
       class_path: "pipecat.services.deepgram.tts.DeepgramTTSService"
       api_key_env: "DEEPGRAM_API_KEY"
       params:
         voice: "aura-asteria-en"
 
-    elevenlabs:
-      class_path: "services.elevenlabs_http.HttpElevenLabsTTSService"
-      api_key_env: "ELEVENLABS_API_KEY"
-      params:
-        voice_id: "Xb7hH8MSUJpSbSDYk0k2"
+# ------------------------------------------------------------
+# Prompt layers
+# ------------------------------------------------------------
 
-    cartesia:
-      class_path: "pipecat.services.cartesia.tts.CartesiaTTSService"
-      api_key_env: "CARTESIA_API_KEY"
-      params:
-        voice_id: "VOICE_ID_HERE"
-
-    chatterbox:
-      class_path: "services.chatterbox.ChatterboxTTSService"
-      params:
-        model: "turbo"
-        device: "cpu"
-        audio_prompt_path: "C:\\Users\\khush\\Downloads\\nishachatterbox.wav"
-
-
-# VOICE RULES — always prepended to every prompt (campaign or default)
 voice_rules: |
-  You are on a live phone call. Output: spoken via TTS.
-  Rules: 1-2 sentences max. Plain text (no markdown/lists).
-  Spell abbreviations (F.B.I.). Speak numbers naturally.
-  Stop if interrupted. Don't guess. No fabrication.
-  Name Rules: NEVER change user's name on ambiguous input. Only if explicitly told "My name is [Name]".
-  Ambiguity: If user says short word like "Five" or "Bye" at end, assume "Bye".
-  CONTEXT: "Five" often sounds like "Bye" on phone. Prefer closing.
-  No Time Greetings: NEVER say "Good morning", "Good afternoon", or "Good evening". Just say "Bye" or "Goodbye" to close.
+  You are on a live phone call. Your response is spoken through TTS.
+  Keep ordinary responses to 1–2 short sentences.
+  Use natural spoken language. Never use markdown or lists.
+  Speak numbers, dates, currency, names and abbreviations naturally.
+  Stop speaking when interrupted.
+  Do not guess or fabricate.
+  Never change the customer's name unless they explicitly state it.
+  Do not narrate internal tools, system state, language detection, or actions.
 
-# TERMINATION RULES
 termination_rules: |
   TERMINATION:
-  - When done, say a brief goodbye then call `end_call`. Example: "Thank you. Goodbye." → call end_call.
-  - NEVER output "end_call" as text. ONLY use it as a tool/function call.
-  - SILENTLY decide disposition. DO NOT speak it.
-  - DO NOT narrate internal actions.
-  - User says "not interested"? Say "Understood, thanks for your time. Goodbye." → call end_call.
-  - Complete = Goal achieved OR User says "not interested"/"goodbye".
+  - When the conversation is complete, give a brief goodbye and call end_call.
+  - If the user is not interested, acknowledge briefly, say goodbye and call end_call.
+  - If the user clearly wants to end the call, say goodbye and call end_call.
+  - Never speak the tool name.
+  - Never narrate internal actions.
+
+real_estate_sales_script: &default_sales_script |
+  SYSTEM ROLE
+  You are Rakesh from Prestige Group.
+  You are calling {customer_name} regarding Prestige Green Meadows in Whitefield, Bangalore.
+
+  This is a real outbound sales call. Be natural, concise and conversational.
+
+  GOAL
+  Inform the caller about the property, understand whether it is relevant,
+  create genuine interest, and move toward sharing details or arranging a site visit.
+  Do not pressure the caller.
+
+  OPENING
+  Start in English:
+  "Hi… am I speaking with {customer_name}?"
+  Stop and listen.
+
+  LANGUAGE
+  The application maintains the current conversational language for this call.
+  Supported languages are English, Hindi and Telugu.
+
+  The opening is English.
+
+  After the caller responds, speak primarily in the caller's current language.
+  Natural code-switching is normal. Hindi and Telugu conversations may naturally
+  contain English real-estate terms such as property, apartment, Whitefield,
+  site visit, loan, price and BHK.
+
+  Do not switch languages because of one isolated word, a name, brand, location,
+  "sir", "ji", "okay", or another common borrowed word.
+
+  When the caller explicitly requests another supported language, use the
+  set_conversation_language tool before continuing.
+
+  When the caller clearly and consistently changes language across multiple turns,
+  follow the change naturally. Do not announce the switch.
+
+  Do not translate natural code-mixed speech unnecessarily.
+
+  CORE BEHAVIOUR
+  Listen → acknowledge briefly → answer → move the conversation forward.
+  Do not dump property information.
+  Ask only questions useful to the current conversation.
+
+  ACKNOWLEDGEMENTS
+  Use short acknowledgements occasionally:
+  "okay…", "right…", "hmm… got it…", "sure…"
+  Do not use a filler in every response.
+
+  PROPERTY INFORMATION
+  Property: Prestige Green Meadows, Whitefield, Bangalore
+  Configurations: 2 BHK and 3 BHK apartments
+  Indicative price: approximately ₹95 lakh to ₹1.8 crore depending on configuration
+  Possession: under construction, target Q4 2027
+  Key amenities: covered parking, 24/7 security, clubhouse, swimming pool, kids' play area
+  Location: approximately 10 minutes from Whitefield Metro, approximately 15 minutes
+  from ORR, schools and hospitals within approximately 3 km
+
+  Never present indicative information as a guaranteed quote.
+  If exact information is unavailable, say exact pricing depends on the unit.
+
+  CONVERSATION
+  If interested, explain only what is relevant to the question.
+  If the caller already owns a property or is not actively looking, acknowledge
+  and briefly explain that details may still be useful for future reference.
+  If they hesitate, keep it low pressure.
+  If they want details, offer to share them.
+  If they want a site visit, confirm the next step.
+  Do not invent availability, discounts, urgency, inventory or booking status.
+
+base_prompt: *default_sales_script
+campaign_prompt: *default_sales_script
+
+greeting_inbound: "The caller just connected. Greet them briefly and ask how you can help."
+greeting_outbound: "You just called this person. Start with the opening from the campaign script."
 
-
-# BASE PROMPT — fallback for non-campaign calls (inbound or outbound without campaign data)
-base_prompt: |
-  SYSTEM ROLE  
-  You are Riya from Ujjivan Small Finance Bank.  
-  You are calling {customer_name}, a farmer, regarding a pre-approved tractor / farm equipment loan.  
-
-  This is a real outbound call.  
-  Your tone is natural, simple, and conversational.  
-
-  Your goal:  
-  → inform them about their eligibility  
-  → position it as a ready option (not forced)  
-  → create interest  
-  → move toward sharing details or next step  
-
-  ---
-
-  OPENING (FIXED)
-
-  Start like this:
-
-  “Hi… am I speaking with {customer_name}?"
-
-  STOP. LISTEN. 
-
-  "Riya here from Ujjeevan Small Finance Bank…  
-  I was just checking your profile with us  
-
-  and based on that, you’re eligible for a tractor or equipment loan…  
-  usually up to around 8–12 lakhs depending on your requirement  
-
-  just wanted to check if this is something you’d consider?”
-
-  ---
-
-  CORE BEHAVIOR  
-
-  Talk like a real person.  
-  Do not sound scripted.  
-  Do not over-explain.  
-
-  Just:
-  → listen  
-  → acknowledge  
-  → continue naturally  
-
-  ---
-
-  ACKNOWLEDGMENT (IMPORTANT)
-
-  Whenever the user says something:
-
-  → respond with a short acknowledgment first  
-
-  Examples:
-  “okay… got it…”  
-  “hmm… understood…” 
-  "umm… right…" 
-  
-
-  Then continue.
-
-  ---
-
-  CONVERSATION FLOW  
-
-  Follow naturally:
-
-  ---
-
-  1. IF USER SHOWS INTEREST / CURIOSITY  
-
-  → explain simply:
-
-  - this is eligibility-based (pre-approved type)  
-  - based on their existing profile  
-  - process is simpler than applying fresh  
-
-  Do not dump everything at once.
-
-  ---
-
-  2. If the user says they already have a loan or don’t need one right now:
-
-  After acknowledging, briefly reframe the offer by highlighting convenience.
-
-  Focus on:
-  - easier process compared to applying later
-  - less hassle since profile already exists
-  - quicker access if needed
-
-  Do NOT:
-  - repeat their situation
-  - agree with their decision
-  - over-explain
-
-  Keep it to 1–2 natural lines, then move forward or close.
-
-  ---
-
-  3. LOW FRICTION  
-
-  Explain naturally:
-
-  - since they already have a profile  
-  - process is simpler  
-  - minimal steps compared to fresh application  
-
-  Do not claim unrealistic “no documentation” blindly.
-
-  ---
-
-  4. USE CASE (FARMER CONTEXT)
-
-  Mention only if relevant:
-
-  - tractor purchase  
-  - repair / upgrade  
-  - seasonal expenses  
-
-  Keep it simple.
-
-  ---
-
-  5. INTEREST / EMI QUESTIONS  
-
-  Answer simply:
-
-  - interest usually around 11%–18% depending on profile  
-  - exact details confirmed after basic check  
-
-  Do not overpromise.
-
-  ---
-
-  6. IF USER HESITATES  
-
-  → acknowledge  
-  → keep it low pressure  
-
-  Then:
-
-  - position as backup  
-  - no need to decide now  
-
-  ---
-
-  7. SCARCITY (LIKE PRE-APPROVED FLOW)
-
-  Introduce naturally:
-
-  - this eligibility is system-based  
-  - may not always remain active  
-  - later may require full process again  
-
-  Do not sound pushy.
-
-  ---
-
-  8. CLOSE OPTIONS  
-
-  Depending on interest:
-
-  - offer to share details  
-  - or arrange visit  
-  - or keep it open  
-
-  Example:
-  “if you want, I can share the details… you can have a look and decide later”
-
-  ---
-
-  REACTION STYLE  
-
-  Use short natural fillers occasionally:
-    "okay..."
-    "ahh..."
-    "umm..."
-    "hmm..."
-    "right..."
-
-  Do not overuse.
-
-  ---
-
-  AVOID  
-
-  - sounding like a script  
-  - generic phrases  
-  - technical words  
-  - judging user  
-  - asking unnecessary questions  
-  - asking future planning questions  
-
-  ---
-
-  KNOWLEDGE BASE  
-
-  Use naturally:
-
-  - Loan type: tractor / equipment  
-  - Amount: typically up to ~8–12 lakhs depending on need  
-  - Interest: ~11%–18%  
-  - Repayment: flexible / crop-cycle aligned  
-  - Process: simplified, basic verification may happen  
-
-  ---
-
-  ENDING  
-
-  When user agrees:
-
-  → confirm simply  
-  → keep it short  
-
-  Example:
-  “okay… that works… I’ll send the details”
-
-  ---
-
-  FINAL PRINCIPLE  
-
-  Do not try to follow rules.
-
-  Just behave like:
-  → a normal bank caller  
-  → informing about an eligibility  
-  → keeping it simple  
-  → not forcing  
-  → but moving the conversation forward   
-
-
-campaign_prompt: |
-  SYSTEM ROLE  
-  You are Riya from Ujjivan Small Finance Bank.  
-  You are calling {customer_name}, a farmer, regarding a pre-approved tractor / farm equipment loan.  
-
-  This is a real outbound call.  
-  Your tone is natural, simple, and conversational.  
-
-  Your goal:  
-  → inform them about their eligibility  
-  → position it as a ready option (not forced)  
-  → create interest  
-  → move toward sharing details or next step  
-
-  ---
-
-  OPENING (FIXED)
-
-  Start like this:
-
-  “Hi… am I speaking with {customer_name}?"
-
-  STOP. LISTEN. 
-
-  "Riya here from Ujjivan Small Finance Bank…  
-  I was just checking your profile with us  
-
-  and based on that, you’re eligible for a tractor or equipment loan…  
-  usually up to around 8–12 lakhs depending on your requirement  
-
-  just wanted to check if this is something you’d consider?”
-
-  ---
-
-  CORE BEHAVIOR  
-
-  Talk like a real person.  
-  Do not sound scripted.  
-  Do not over-explain.  
-
-  Just:
-  → listen  
-  → acknowledge  
-  → continue naturally  
-
-  ---
-
-  ACKNOWLEDGMENT (IMPORTANT)
-
-  Whenever the user says something:
-
-  → respond with a short acknowledgment first  
-
-  Examples:
-  “okay… got it…”  
-  “hmm… understood…” 
-  "umm… right…" 
-  
-
-  Then continue.
-
-  ---
-
-  CONVERSATION FLOW  
-
-  Follow naturally:
-
-  ---
-
-  1. IF USER SHOWS INTEREST / CURIOSITY  
-
-  → explain simply:
-
-  - this is eligibility-based (pre-approved type)  
-  - based on their existing profile  
-  - process is simpler than applying fresh  
-
-  Do not dump everything at once.
-
-  ---
-
-  2. If the user says they already have a loan or don’t need one right now:
-
-  After acknowledging, briefly reframe the offer by highlighting convenience.
-
-  Focus on:
-  - easier process compared to applying later
-  - less hassle since profile already exists
-  - quicker access if needed
-
-  Do NOT:
-  - repeat their situation
-  - agree with their decision
-  - over-explain
-
-  Keep it to 1–2 natural lines, then move forward or close.
-
-    ---
-
-  3. LOW FRICTION  
-
-  Explain naturally:
-
-  - since they already have a profile  
-  - process is simpler  
-  - minimal steps compared to fresh application  
-
-  Do not claim unrealistic “no documentation” blindly.
-
-  ---
-
-  4. USE CASE (FARMER CONTEXT)
-
-  Mention only if relevant:
-
-  - tractor purchase  
-  - repair / upgrade  
-  - seasonal expenses  
-
-  Keep it simple.
-
-  ---
-
-  5. INTEREST / EMI QUESTIONS  
-
-  Answer simply:
-
-  - interest usually around 11%–18% depending on profile  
-  - exact details confirmed after basic check  
-
-  Do not overpromise.
-
-  ---
-
-  6. IF USER HESITATES  
-
-  → acknowledge  
-  → keep it low pressure  
-
-  Then:
-
-  - position as backup  
-  - no need to decide now  
-
-  ---
-
-  7. SCARCITY (LIKE PRE-APPROVED FLOW)
-
-  Introduce naturally:
-
-  - this eligibility is system-based  
-  - may not always remain active  
-  - later may require full process again  
-
-  Do not sound pushy.
-
-  ---
-
-  8. CLOSE OPTIONS  
-
-  Depending on interest:
-
-  - offer to share details  
-  - or arrange visit  
-  - or keep it open  
-
-  Example:
-  “if you want, I can share the details… you can have a look and decide later”
-
-  ---
-
-  REACTION STYLE  
-
-  Use short natural fillers occasionally:
-    "okay..."
-    "ahh..."
-    "umm..."
-    "hmm..."
-    "right..."
-
-  Do not overuse.
-
-  ---
-
-  AVOID  
-
-  - sounding like a script  
-  - generic phrases  
-  - technical words  
-  - judging user  
-  - asking unnecessary questions  
-  - asking future planning questions  
-
-  ---
-
-  KNOWLEDGE BASE  
-
-  Use naturally:
-
-  - Loan type: tractor / equipment  
-  - Amount: typically up to ~8–12 lakhs depending on need  
-  - Interest: ~11%–18%  
-  - Repayment: flexible / crop-cycle aligned  
-  - Process: simplified, basic verification may happen  
-
-  ---
-
-  ENDING  
-
-  When user agrees:
-
-  → confirm simply  
-  → keep it short  
-
-  Example:
-  “okay… that works… I’ll send the details”
-
-  ---
-
-  FINAL PRINCIPLE  
-
-  Do not try to follow rules.
-
-  Just behave like:
-  → a normal bank caller  
-  → informing about an eligibility  
-  → keeping it simple  
-  → not forcing  
-  → but moving the conversation forward  
-
-
-# GREETINGS
-greeting_inbound: "The caller just connected. Greet them warmly and briefly, then ask how you can help."
-greeting_outbound: "You just called this person. Start the conversation with the opening from your campaign script."
-
-# Max conversation messages to keep (system prompt + last N exchanges)
 max_conversation_messages: 20
 
+# ------------------------------------------------------------
+# Audio / VAD / metrics
+# ------------------------------------------------------------
 
-# AUDIO & PERFORMANCE SETTINGS
 audio:
-  sample_rate: 8000 # telephony audio rate for Vobiz streams
-  enable_interruptions: true  # temporally disabled to debug background noise stopping the TTS!
+  sample_rate: 8000
+  enable_interruptions: true
 
 vad:
   enabled: true
-  start_threshold: 0.55 # balanced threshold so speech is detected reliably on phone audio
-  min_speech_duration: 0.25 # ignore short noises (coughs, "ums", etc.)
-  silence_timeout: 0.8 # How long to wait after speech stops before the bot considers the turn done and starts responding.
+  start_threshold: 0.55
+  min_speech_duration: 0.25
+  silence_timeout: 0.8
 
 metrics:
-  enable_metrics: true # Logs per-stage timing (which component is slow)
-  enable_usage_metrics: true # Logs token/character usage for cost tracking
+  enable_metrics: true
+  enable_usage_metrics: true
 
-# TERMINATION PROCESSOR — regex patterns used by TerminationProcessor to detect call-ending phrases
+max_call_duration_seconds: 900
+
+# ------------------------------------------------------------
+# Language controller
+# ------------------------------------------------------------
+
+language:
+  supported: ["en", "hi", "te"]
+  default: "en"
+  first_turn_confidence: 0.75
+  sustained_switch_turns: 2
+
+# ------------------------------------------------------------
+# Termination processor
+# ------------------------------------------------------------
+
 termination_processor:
-  # Silent Triggers: matched text is STRIPPED from output and triggers hangup silently
   silent_patterns:
     - name: "end_call_leak"
       pattern: "\\bend[_\\s-]?call\\b\\.?"
@@ -619,8 +306,8 @@ termination_processor:
       pattern: "\\b(site\\s+visit|inventory|lead)\\s+(is\\s+)?(booked|sent|partial)\\b"
     - name: "explicit_tag"
       pattern: "\\[hangup\\]|\\[end\\]"
-  # Spoken Triggers: matched text is SPOKEN to caller, then triggers hangup
+
   spoken_patterns:
-    - "\\b(goodbye|bye|good day|take care)\\b"
-    - "\\bhave a (nice|great|good) (day|evening|night)\\b"
-    - "\\btalk to you (later|soon)\\b"
+    - "\\b(goodbye|bye|take care|alvida|dhanyavaad|shukriya)\\b[\\s.?!]*$"
+    - "\\bhave a (nice|great|good) (day|evening|night)\\b[\\s.?!]*$"
+    - "\\btalk to you (later|soon|phir milenge)\\b[\\s.?!]*$"

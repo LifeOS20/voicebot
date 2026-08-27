@@ -129,19 +129,23 @@ class TerminationProcessor(FrameProcessor):
                     logger.info(f"[{self._stream_id}] Silent Termination Triggered by pattern: '{name}'")
                     cleaned_text = pattern.sub("", cleaned_text) # Remove the trigger phrase
             
-            # Check Spoken Patterns
+            # Check Spoken Patterns - only match at end of text
+            end_pos = len(cleaned_text)
             if not hangup_requested: # Only check if not already triggered by silent custom commands
                 for pattern in self.spoken_termination_patterns:
-                    if pattern.search(cleaned_text):
-                        hangup_requested = True
-                        # Do NOT strip spoken phrases like "Goodbye"
-                        break
+                    match = pattern.search(cleaned_text)
+                    if match:
+                        # Only trigger if match is at end of text (within ~3 chars)
+                        if end_pos - match.end() <= 3:
+                            hangup_requested = True
+                            # Do NOT strip spoken phrases like "Goodbye"
+                            break
 
             if hangup_requested:
                 # Strip leading/trailing punctuation and whitespace
                 cleaned_text = re.sub(r"^[.,!?\s]+|[.,!?\s]+$", "", cleaned_text)
                 
-                logger.info(f"[{self._stream_id}] Termination Triggered. Cleaned: '{cleaned_text}'")
+                logger.info(f"[{self._stream_id}] REGEX_FALLBACK_TERMINATION triggered. Cleaned: '{cleaned_text}'")
                 
                 # Update state
                 self._termination_requested = True

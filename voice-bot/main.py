@@ -188,10 +188,11 @@ async def start_outbound_call(
 
     The 'to' number comes from the caller and 'from' is our Vobiz number.
     """
-    # API KEY AUTHENTICATION
+    # API KEY AUTHENTICATION - fail closed if not configured
     required_key = os.getenv("OUTBOUND_API_KEY")
     if not required_key:
-        logger.warning("OUTBOUND_API_KEY not set in environment! Allowing request (RISKY).")
+        logger.error("OUTBOUND_API_KEY not set in environment! Cannot process outbound call.")
+        raise HTTPException(status_code=500, detail="Server misconfiguration: OUTBOUND_API_KEY not set")
     elif x_api_key != required_key:
         logger.warning(f"Unauthorized outbound call attempt. Key provided: {x_api_key}")
         raise HTTPException(status_code=401, detail="Invalid API Key")

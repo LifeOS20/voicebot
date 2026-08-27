@@ -22,15 +22,8 @@ class WebPCMFrameSerializer(FrameSerializer):
             return json.dumps({"event": "clearAudio", "streamId": self._stream_id})
 
         if isinstance(frame, AudioRawFrame):
-            head = frame.audio[:10]
-            try:
-                import struct
-                samples = struct.unpack(f"<{len(frame.audio)//2}h", frame.audio)
-                max_amp = max(abs(s) for s in samples) if samples else 0
-            except Exception:
-                max_amp = -1
-            
-            logger.info(f"[WebPCM] TX -> len:{len(frame.audio)}, sr:{frame.sample_rate}, amp:{max_amp}, head:{head.hex()}")
+            # Debug logging only when needed - avoid expensive struct.unpack
+            logger.debug(f"[WebPCM] TX -> len:{len(frame.audio)}, sr:{frame.sample_rate}")
 
             payload = base64.b64encode(frame.audio).decode("utf-8")
             return json.dumps(

@@ -1,6 +1,6 @@
 {
-  "from_number": "+918310597377",
-  "to_number": "+919038397133",
+  "from_number": "",
+  "to_number": "",
   "telephony": "epicode",
   "campaign_name": "Dial Buzz",
   "server": "dev",
@@ -8,7 +8,7 @@
   "customer_data": {
     "product_name": "debt_collection_NHR",
     "client_name": "smartcoin",
-    "customer_name": "Deepshika",
+    "customer_name": "Deep",
     "language": "english",
     "emi_amount": "1222",
     "due_date": "15/3/26",
