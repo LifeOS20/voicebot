@@ -1,0 +1,21 @@
+{
+  "from_number": "+918310597377",
+  "to_number": "+919038397133",
+  "telephony": "epicode",
+  "campaign_name": "Dial Buzz",
+  "server": "dev",
+  "tenant_id": "genstrat",
+  "customer_data": {
+    "product_name": "debt_collection_NHR",
+    "client_name": "smartcoin",
+    "customer_name": "Deepshika",
+    "language": "english",
+    "emi_amount": "1222",
+    "due_date": "15/3/26",
+    "job_title": "GEN AI Enginner",
+    "max_salary": "2 Lakh",
+    "country_p": "Dubai"
+  },
+  "product_id": "sdvvgerer",
+  "strategy_id": "sdhteevdgresvsd"
+}

@@ -1,0 +1,16 @@
+﻿fastapi
+uvicorn
+python-dotenv
+loguru
+httpx
+pyyaml
+requests
+pipecat-ai[daily,deepgram,openai,elevenlabs,silero]
+redis
+
+# Local TTS stack (known-good compatible versions)
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
+transformers==4.46.3
+chatterbox-tts==0.1.6

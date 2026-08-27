@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voicebot Local Testing</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+
+<body>
+    <div class="background-overlay">
+        <!-- Abstract gradient circles mimicking blurred stacked coins -->
+        <div class="blur-circle circle-1"></div>
+        <div class="blur-circle circle-2"></div>
+        <div class="blur-circle circle-3"></div>
+    </div>
+
+    <div class="card">
+        <div class="card-header">
+            Humanoid AI Voice Call
+        </div>
+
+        <div class="card-body">
+            <div class="avatar-container">
+                <div class="avatar agent">
+                    <!-- Agent Icon (Black circle with green arrow similar to pic) -->
+                    <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+                        <circle cx="50" cy="50" r="45" fill="#1e1e1e" />
+                        <path d="M40 70 L60 50 L40 30" fill="none" stroke="#22c55e" stroke-width="12"
+                            stroke-linecap="round" stroke-linejoin="round" />
+                    </svg>
+                </div>
+                <div class="label">AI Agent</div>
+            </div>
+
+            <div class="waveform" id="waveform">
+                <div class="bar"></div>
+                <div class="bar"></div>
+                <div class="bar"></div>
+                <div class="bar"></div>
+                <div class="bar"></div>
+                <div class="bar"></div>
+                <div class="bar"></div>
+                <div class="bar"></div>
+                <div class="bar"></div>
+                <div class="bar"></div>
+                <div class="bar"></div>
+                <div class="bar"></div>
+                <div class="bar"></div>
+            </div>
+
+            <div class="avatar-container">
+                <div class="avatar user">
+                    <!-- Placeholder Person Icon -->
+                    <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+                        <circle cx="50" cy="50" r="45" fill="#d1d5db" />
+                        <circle cx="50" cy="40" r="15" fill="#ffffff" />
+                        <path d="M25 80 Q50 55 75 80" fill="none" stroke="#ffffff" stroke-width="12"
+                            stroke-linecap="round" />
+                    </svg>
+                </div>
+                <div class="label">Rakesh</div>
+            </div>
+        </div>
+
+        <div class="card-footer">
+            <button class="call-btn end-call" id="callButton">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                    stroke-linecap="round" stroke-linejoin="round">
+                    <path
+                        d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.42 19.42 0 0 1-7-7 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91">
+                    </path>
+                </svg>
+                <span id="callButtonText">Connect</span>
+            </button>
+            <div id="status" style="font-size: 11px; margin-top:10px; color:#666; text-align: center;">Waiting...</div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+
+</html>
