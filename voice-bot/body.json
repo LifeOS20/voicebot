@@ -1,21 +1,7 @@
 {
-  "from_number": "",
-  "to_number": "",
-  "telephony": "epicode",
-  "campaign_name": "Dial Buzz",
-  "server": "dev",
-  "tenant_id": "genstrat",
-  "customer_data": {
-    "product_name": "debt_collection_NHR",
-    "client_name": "smartcoin",
-    "customer_name": "Deep",
-    "language": "english",
-    "emi_amount": "1222",
-    "due_date": "15/3/26",
-    "job_title": "GEN AI Enginner",
-    "max_salary": "2 Lakh",
-    "country_p": "Dubai"
-  },
-  "product_id": "sdvvgerer",
-  "strategy_id": "sdhteevdgresvsd"
+  "_comment": "Example request body for POST /outbound. This replaces a previous body.json that was leftover test data from an unrelated debt-collection product (real-looking phone numbers, a customer name, EMI/due-date/salary fields, and a real client's name) and didn't even match this API's actual schema. This one does. Send it with header 'x-api-key: <your OUTBOUND_API_KEY>'.",
+  "to": "+919999999999",
+  "customer_name": "Test Customer",
+  "campaign_prompt": null,
+  "greeting": null
 }

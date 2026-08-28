@@ -1,4 +1,4 @@
-﻿fastapi
+fastapi
 uvicorn
 python-dotenv
 loguru
@@ -8,9 +8,18 @@ requests
 pipecat-ai[daily,deepgram,openai,elevenlabs,silero]
 redis
 
-# Local TTS stack (known-good compatible versions)
-torch==2.6.0
-torchvision==0.21.0
-torchaudio==2.6.0
-transformers==4.46.3
-chatterbox-tts==0.1.6
+# NOTE: torch, torchvision, torchaudio, transformers, and chatterbox-tts
+# were removed here. They were only needed by the local Chatterbox TTS
+# service, which no longer exists in this codebase (services/chatterbox.py
+# was deleted, and there's no chatterbox entry left in config.yaml's
+# provider registry). Together they added several GB to every install/
+# Docker image for a feature you're not using — dead weight, not "keeping
+# options open." If you genuinely want local TTS back later, re-add the
+# specific package your chosen local model needs at that point.
+#
+# ALSO NOTE: pipecat-ai is still unpinned. Run `pip freeze` once your stack
+# is verified working end-to-end and commit the exact versions — an
+# unpinned dependency here means a future Pipecat release could silently
+# change behavior or break your bot on your next install. I didn't guess a
+# pin myself since I can't verify compatibility without running the stack
+# against your actual providers.

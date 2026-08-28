@@ -405,7 +405,7 @@ class ServiceFactory:
         )
 
         logger.info(
-            "Creating %s provider=%s class=%s",
+            "Creating {} provider={} class={}",
             service_type,
             provider_name,
             class_path,
@@ -430,6 +430,52 @@ def _prune_history(
             -(max_messages - 1):
         ],
     ]
+
+
+class _HistoryPruner(FrameProcessor):
+    """Keeps the LLM context bounded so per-turn token cost doesn't grow
+    across a long call.
+
+    FIXED: `_prune_history()` above, and `max_conversation_messages: 20` in
+    config.yaml, both existed already — but nothing ever called
+    `_prune_history()`. Every turn of a long conversation was re-sending the
+    ENTIRE, ever-growing message history to the LLM, so a 15-minute call
+    could cost several times more in input tokens by the end than the start.
+    This processor runs the existing pruning logic after each turn.
+    """
+
+    def __init__(
+        self,
+        context: OpenAILLMContext,
+        max_messages: int,
+        stream_id: str,
+    ) -> None:
+        super().__init__()
+        self._context = context
+        self._max_messages = max_messages
+        self._stream_id = stream_id
+
+    async def process_frame(
+        self,
+        frame: Frame,
+        direction: FrameDirection,
+    ) -> None:
+        await super().process_frame(frame, direction)
+
+        if direction == FrameDirection.DOWNSTREAM:
+            before = len(self._context.messages)
+            _prune_history(self._context.messages, self._max_messages)
+            after = len(self._context.messages)
+
+            if after < before:
+                logger.debug(
+                    "[{}] Pruned conversation history {} -> {} messages",
+                    self._stream_id,
+                    before,
+                    after,
+                )
+
+        await self.push_frame(frame, direction)
 
 
 async def run_bot(
@@ -531,7 +577,7 @@ async def run_bot(
 
         if not provider_call_id:
             logger.warning(
-                "[%s] Missing Vobiz call ID (%s)",
+                "[{}] Missing Vobiz call ID ({})",
                 stream_id,
                 trigger,
             )
@@ -546,7 +592,7 @@ async def run_bot(
 
         if not auth_id or not auth_token:
             logger.warning(
-                "[%s] Missing Vobiz auth credentials (%s)",
+                "[{}] Missing Vobiz auth credentials ({})",
                 stream_id,
                 trigger,
             )
@@ -578,13 +624,13 @@ async def run_bot(
                 204,
             }:
                 logger.info(
-                    "[%s] Vobiz hangup succeeded (%s)",
+                    "[{}] Vobiz hangup succeeded ({})",
                     stream_id,
                     trigger,
                 )
             else:
                 logger.warning(
-                    "[%s] Vobiz hangup failed status=%s (%s)",
+                    "[{}] Vobiz hangup failed status={} ({})",
                     stream_id,
                     response.status_code,
                     trigger,
@@ -592,7 +638,7 @@ async def run_bot(
 
         except Exception:
             logger.exception(
-                "[%s] Vobiz hangup request failed (%s)",
+                "[{}] Vobiz hangup request failed ({})",
                 stream_id,
                 trigger,
             )
@@ -718,7 +764,7 @@ async def run_bot(
             params: FunctionCallParams,
         ):
             logger.info(
-                "[%s] end_call invoked language=%s",
+                "[{}] end_call invoked language={}",
                 stream_id,
                 language_state.current_language,
             )
@@ -843,7 +889,7 @@ async def run_bot(
 
             except Exception as exc:
                 logger.exception(
-                    "[%s] Language switch failed",
+                    "[{}] Language switch failed",
                     stream_id,
                 )
 
@@ -936,6 +982,15 @@ async def run_bot(
             )
         )
 
+        history_pruner = _HistoryPruner(
+            context=context,
+            max_messages=config.get(
+                "max_conversation_messages",
+                20,
+            ),
+            stream_id=stream_id,
+        )
+
         pipeline = Pipeline(
             [
                 transport.input(),
@@ -947,6 +1002,7 @@ async def run_bot(
                 tts,
                 transport.output(),
                 context_aggregator.assistant(),
+                history_pruner,
             ]
         )
 
@@ -994,7 +1050,7 @@ async def run_bot(
             client,
         ):
             logger.info(
-                "[%s] Connected initial_language=en",
+                "[{}] Connected initial_language=en",
                 stream_id,
             )
 
@@ -1053,7 +1109,7 @@ async def run_bot(
                 ] = True
 
                 logger.warning(
-                    "[%s] Hard call timeout",
+                    "[{}] Hard call timeout",
                     stream_id,
                 )
 
@@ -1079,8 +1135,8 @@ async def run_bot(
             )
 
             logger.info(
-                "[%s] Disconnected language=%s "
-                "turns=%s switches=%s",
+                "[{}] Disconnected language={} "
+                "turns={} switches={}",
                 stream_id,
                 snapshot["current_language"],
                 snapshot["turn_index"],
@@ -1101,13 +1157,13 @@ async def run_bot(
 
         except Exception:
             logger.exception(
-                "[%s] Pipeline error",
+                "[{}] Pipeline error",
                 stream_id,
             )
 
     except Exception:
         logger.exception(
-            "[%s] Call initialization/runtime failure",
+            "[{}] Call initialization/runtime failure",
             stream_id,
         )
 

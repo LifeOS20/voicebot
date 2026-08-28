@@ -54,7 +54,7 @@ providers:
         base_url: "https://api.sarvam.ai/v1"
         temperature: 0.2
         max_completion_tokens: 160
-        tools:
+        tools: &llm_tools
           - type: "function"
             function:
               name: "end_call"
@@ -87,30 +87,7 @@ providers:
         base_url: "https://api.groq.com/openai/v1"
         temperature: 0.2
         max_completion_tokens: 160
-        tools:
-          - type: "function"
-            function:
-              name: "end_call"
-              description: "End the call when the conversation is complete, the caller is not interested, or the caller clearly wants to end the call."
-              parameters:
-                type: "object"
-                properties: {}
-                additionalProperties: false
-
-          - type: "function"
-            function:
-              name: "set_conversation_language"
-              description: "Change the language spoken by the agent. Use only when the caller explicitly requests another supported language or clearly changes their conversational language. Do not use this for ordinary code-switching or isolated words."
-              parameters:
-                type: "object"
-                properties:
-                  language:
-                    type: "string"
-                    enum: ["en", "hi", "te"]
-                  reason:
-                    type: "string"
-                required: ["language", "reason"]
-                additionalProperties: false
+        tools: *llm_tools
 
     cerebras:
       class_path: "pipecat.services.openai.llm.OpenAILLMService"
@@ -120,6 +97,14 @@ providers:
         base_url: "https://api.cerebras.ai/v1"
         temperature: 0.2
         max_completion_tokens: 160
+        # FIXED: cerebras previously had no tools entry at all. If you ever
+        # failed over to it (deliberately, or automatically in a future
+        # failover implementation), the LLM would silently lose access to
+        # end_call and set_conversation_language — no error, just the whole
+        # termination/language architecture disappearing, leaving only the
+        # regex safety net. Same shared anchor as sarvam/groq now, so this
+        # can't drift out of sync again.
+        tools: *llm_tools
 
   # ------------------------------------------------------------
   # TTS

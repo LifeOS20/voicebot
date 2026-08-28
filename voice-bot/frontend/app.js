@@ -13,8 +13,19 @@ const callBtnText = document.getElementById('callButtonText');
 const statusText = document.getElementById('status');
 const waveform = document.getElementById('waveform');
 
-// Use current host to guess websocket URL. Testing locally uses localhost:8000
-const WS_URL = "ws://localhost:8000/ws-web";
+// Derive the WebSocket URL from the page itself, so this works both on
+// localhost AND once you host this frontend anywhere for a client demo.
+// FIXED: this used to be hardcoded to ws://localhost:8000/ws-web, which only
+// ever worked on the developer's own machine, and ws:// (not wss://) gets
+// blocked by the browser as mixed content the moment the page is served
+// over HTTPS (which almost every hosting provider does by default).
+//
+// If your frontend is hosted separately from the backend (e.g. Vercel for
+// the page, a VM for the FastAPI server), replace BACKEND_HOST below with
+// your backend's actual host:port instead of window.location.host.
+const BACKEND_HOST = window.location.host; // e.g. "localhost:8000" or "your-backend.example.com"
+const WS_PROTOCOL = window.location.protocol === "https:" ? "wss:" : "ws:";
+const WS_URL = `${WS_PROTOCOL}//${BACKEND_HOST}/ws-web`;
 
 // Utility: convert Int16Array to Base64
 function int16ArrayToBase64(int16Array) {

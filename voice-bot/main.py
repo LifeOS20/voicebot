@@ -16,7 +16,6 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketTransport,
 )
 from bot import run_bot
-from services.chatterbox import ChatterboxTTSService
 
 import redis.asyncio as redis
 import json
@@ -94,22 +93,6 @@ async def lifespan(app: FastAPI):
     # Initialize Redis (or fallback)
     redis_url = os.getenv("REDIS_URL", "redis://localhost")
     await CALL_MANAGER.connect(redis_url)
-
-    # Optional warmup so first response does not pay Chatterbox cold-start cost.
-    try:
-        tts_provider = CONFIG.get("active_providers", {}).get("tts")
-        if tts_provider == "chatterbox":
-            tts_params = (
-                CONFIG.get("providers", {})
-                .get("tts", {})
-                .get("chatterbox", {})
-                .get("params", {})
-            )
-            warmup_tts = ChatterboxTTSService(**tts_params)
-            await asyncio.to_thread(warmup_tts.warmup)
-            logger.info("Chatterbox startup warmup complete")
-    except Exception as e:
-        logger.warning(f"Chatterbox startup warmup skipped: {e}")
 
     logger.info("Voice bot config loaded.")
     yield
