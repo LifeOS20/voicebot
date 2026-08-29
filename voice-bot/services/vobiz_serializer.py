@@ -14,7 +14,7 @@ from pipecat.frames.frames import (
     Frame,
     InputAudioRawFrame,
     StartFrame,
-    StartInterruptionFrame,
+    InterruptionFrame,
     OutputTransportMessageFrame,
     OutputTransportMessageUrgentFrame,
     InputDTMFFrame,
@@ -41,7 +41,7 @@ class VobizFrameSerializer(FrameSerializer):
 
     async def serialize(self, frame: Frame) -> str | bytes | None:
         # If the user interrupts, it sends a clearAudio message to stop playback immediately.
-        if isinstance(frame, StartInterruptionFrame):
+        if isinstance(frame, InterruptionFrame):
             return json.dumps({"event": "clearAudio", "streamId": self._stream_id})
 
         # If the bot is speaking, it converts the bots audio into phone-call format and sends it as playAudio

@@ -355,7 +355,16 @@ async def websocket_web_endpoint(websocket: WebSocket):
     logger.info("WebSocket accepted for WEB client")
 
     call_type = "web"
-    stream_id = "web-client"
+    # FIXED: this was hardcoded to the literal string "web-client" for
+    # every single browser connection. Two people opening the demo page at
+    # the same time (or the same person testing twice) would share one
+    # call_id — their metrics/log lines would be indistinguishable from
+    # each other, and they'd both write to the same per-call log file
+    # (logs/call_{label}_{stream_id}.log) concurrently. Telephony calls
+    # get a real unique ID from Vobiz's own handshake; web connections have
+    # no equivalent external ID, so one is generated here the same way
+    # call_id is already generated for outbound calls elsewhere in this file.
+    stream_id = f"web-{uuid.uuid4()}"
 
     try:
         max_duration = CONFIG.get("max_call_duration_seconds", 900)
@@ -368,7 +377,7 @@ async def websocket_web_endpoint(websocket: WebSocket):
                 config=CONFIG,
                 stream_id=stream_id,
                 campaign_data=None, # For testing, no campaign payload
-                call_id="web-test-call",
+                call_id=stream_id,
             ),
             timeout=max_duration,
         )

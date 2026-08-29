@@ -7,8 +7,11 @@ from dotenv import load_dotenv
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.frames.frames import EndTaskFrame, TTSSpeakFrame, FunctionCallResultProperties
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.frames.frames import LLMContextFrame, TTSSpeakFrame, FunctionCallResultProperties
+from pipecat.services.llm_service import FunctionCallParams
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
@@ -58,19 +61,19 @@ async def main():
 
     # Mock end_call handler
     shutdown_state = {"active": False}
-    
-    async def end_call_handler(function_name, tool_call_id, args, llm, context, result_callback):
+
+    async def end_call_handler(params: FunctionCallParams):
         logger.info("LLM invoked end_call. Ending local test.")
         shutdown_state["active"] = True
-        await llm.push_frame(TTSSpeakFrame(text="Thank you for your time. Goodbye."), FrameDirection.DOWNSTREAM)
-        
+        await params.llm.push_frame(TTSSpeakFrame(text="Thank you for your time. Goodbye."), FrameDirection.DOWNSTREAM)
+
         async def _fallback_hangup():
             await asyncio.sleep(3.0)
             await task.cancel()
-            
+
         asyncio.create_task(_fallback_hangup())
-        
-        await result_callback(
+
+        await params.result_callback(
             {"status": "ending"},
             properties=FunctionCallResultProperties(run_llm=False),
         )
@@ -81,10 +84,19 @@ async def main():
     messages = [{"role": "system", "content": system_prompt}]
 
     llm_provider = active_providers["llm"]
-    llm_tools = config.get("providers", {}).get("llm", {}).get(llm_provider, {}).get("params", {}).get("tools", [])
-    
-    context = OpenAILLMContext(messages, tools=llm_tools if llm_tools else None)
-    context_aggregator = llm.create_context_aggregator(context)
+    llm_tools_raw = config.get("providers", {}).get("llm", {}).get(llm_provider, {}).get("params", {}).get("tools", [])
+    llm_tools = [
+        FunctionSchema(
+            name=raw["function"]["name"],
+            description=raw["function"].get("description", ""),
+            properties=raw["function"].get("parameters", {}).get("properties", {}),
+            required=raw["function"].get("parameters", {}).get("required", []),
+        )
+        for raw in llm_tools_raw
+    ]
+
+    context = LLMContext(messages, tools=llm_tools)
+    context_aggregator = LLMContextAggregatorPair(context)
 
     pipeline = Pipeline([
         transport.input(),
@@ -105,8 +117,7 @@ async def main():
     logger.info("Local script starting. Greeting the user...")
     greeting = config.get("greeting_inbound", "Hello! How can I help you today?")
     messages.append({"role": "user", "content": greeting})
-    from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContextFrame
-    await task.queue_frames([OpenAILLMContextFrame(context)])
+    await task.queue_frames([LLMContextFrame(context=context)])
 
     runner = PipelineRunner(handle_sigint=True)
 

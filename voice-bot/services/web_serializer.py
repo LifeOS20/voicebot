@@ -7,7 +7,7 @@ from pipecat.frames.frames import (
     Frame,
     InputAudioRawFrame,
     StartFrame,
-    StartInterruptionFrame,
+    InterruptionFrame,
 )
 
 class WebPCMFrameSerializer(FrameSerializer):
@@ -18,7 +18,7 @@ class WebPCMFrameSerializer(FrameSerializer):
         pass
 
     async def serialize(self, frame: Frame) -> str | bytes | None:
-        if isinstance(frame, StartInterruptionFrame):
+        if isinstance(frame, InterruptionFrame):
             return json.dumps({"event": "clearAudio", "streamId": self._stream_id})
 
         if isinstance(frame, AudioRawFrame):

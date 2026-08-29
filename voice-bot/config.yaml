@@ -1,298 +1,414 @@
-# ============================================================
-# Production voicebot configuration
-# ============================================================
-
 active_providers:
-  stt: "sarvam"
-  llm: "sarvam"
-  tts: "murf"
-
+  stt: sarvam
+  llm: groq
+  tts: sarvam
 providers:
-
-  # ------------------------------------------------------------
-  # STT
-  # ------------------------------------------------------------
   stt:
     sarvam:
-      class_path: "pipecat.services.sarvam.stt.SarvamSTTService"
-      api_key_env: "SARVAM_API_KEY"
+      class_path: pipecat.services.sarvam.stt.SarvamSTTService
+      api_key_env: SARVAM_API_KEY
       params:
-        model: "saaras:v3"
-        language: "unknown"
-        mode: "codemix"
+        model: saaras:v3
+        language: unknown
+        mode: codemix
         sample_rate: 8000
-        input_audio_codec: "pcm_s16le"
+        input_audio_codec: wav
         keepalive_timeout: 10
         keepalive_interval: 5
-
     deepgram:
-      class_path: "pipecat.services.deepgram.stt.DeepgramSTTService"
-      api_key_env: "DEEPGRAM_API_KEY"
+      class_path: pipecat.services.deepgram.stt.DeepgramSTTService
+      api_key_env: DEEPGRAM_API_KEY
       params:
-        model: "nova-2"
-        language: "en"
+        model: nova-3
+        language: multi
         smart_format: true
         sample_rate: 8000
-        encoding: "linear16"
+        encoding: linear16
         channels: 1
-
     openai:
-      class_path: "pipecat.services.openai.stt.OpenAISTTService"
-      api_key_env: "OPENAI_API_KEY"
+      class_path: pipecat.services.openai.stt.OpenAISTTService
+      api_key_env: OPENAI_API_KEY
       params:
-        model: "whisper-1"
-
-  # ------------------------------------------------------------
-  # LLM
-  # ------------------------------------------------------------
+        model: whisper-1
   llm:
     sarvam:
-      class_path: "pipecat.services.openai.llm.OpenAILLMService"
-      api_key_env: "SARVAM_API_KEY"
+      class_path: pipecat.services.openai.llm.OpenAILLMService
+      api_key_env: SARVAM_API_KEY
       params:
-        model: "sarvam-105b-conversations"
-        base_url: "https://api.sarvam.ai/v1"
+        model: sarvam-105b-conversations
+        base_url: https://api.sarvam.ai/v1
         temperature: 0.2
         max_completion_tokens: 160
-        tools: &llm_tools
-          - type: "function"
-            function:
-              name: "end_call"
-              description: "End the call when the conversation is complete, the caller is not interested, or the caller clearly wants to end the call."
-              parameters:
-                type: "object"
-                properties: {}
-                additionalProperties: false
+        tools: &id001
+        - type: function
+          function:
+            name: end_call
+            description: 'End the call when the conversation is complete, the caller
+              is not interested, or the caller clearly wants to end the call.
 
-          - type: "function"
-            function:
-              name: "set_conversation_language"
-              description: "Change the language spoken by the agent. Use only when the caller explicitly requests another supported language or clearly changes their conversational language. Do not use this for ordinary code-switching or isolated words."
-              parameters:
-                type: "object"
-                properties:
-                  language:
-                    type: "string"
-                    enum: ["en", "hi", "te"]
-                  reason:
-                    type: "string"
-                required: ["language", "reason"]
-                additionalProperties: false
-
+              '
+            parameters:
+              type: object
+              properties: {}
+              additionalProperties: false
     groq:
-      class_path: "pipecat.services.openai.llm.OpenAILLMService"
-      api_key_env: "GROQ_API_KEY"
+      class_path: pipecat.services.groq.llm.GroqLLMService
+      api_key_env: GROQ_API_KEY
       params:
-        model: "llama-3.1-8b-instant"
-        base_url: "https://api.groq.com/openai/v1"
-        temperature: 0.2
-        max_completion_tokens: 160
-        tools: *llm_tools
-
+        model: qwen/qwen3.8-27b
+        temperature: 0.7
+        max_completion_tokens: 256
+        tools: *id001
     cerebras:
-      class_path: "pipecat.services.openai.llm.OpenAILLMService"
-      api_key_env: "CEREBRAS_API_KEY"
+      class_path: pipecat.services.openai.llm.OpenAILLMService
+      api_key_env: CEREBRAS_API_KEY
       params:
-        model: "gpt-oss-120b"
-        base_url: "https://api.cerebras.ai/v1"
+        model: gpt-oss-120b
+        base_url: https://api.cerebras.ai/v1
         temperature: 0.2
         max_completion_tokens: 160
-        # FIXED: cerebras previously had no tools entry at all. If you ever
-        # failed over to it (deliberately, or automatically in a future
-        # failover implementation), the LLM would silently lose access to
-        # end_call and set_conversation_language — no error, just the whole
-        # termination/language architecture disappearing, leaving only the
-        # regex safety net. Same shared anchor as sarvam/groq now, so this
-        # can't drift out of sync again.
-        tools: *llm_tools
-
-  # ------------------------------------------------------------
-  # TTS
-  # ------------------------------------------------------------
+        tools: *id001
   tts:
     murf:
-      class_path: "services.murf_http.MurfFalcon2TTSService"
-      api_key_env: "MURF_API_KEY"
+      class_path: services.murf_http.MurfFalcon2TTSService
+      api_key_env: MURF_API_KEY
       _needs_aiohttp: true
       params:
-        model: "falcon-2"
-        voice_id: "Anisha"
-        locale: "en-IN"
-        base_url: "https://in.api.murf.ai"
+        model: falcon-2
+        voice_id: Anisha
+        locale: en-IN
+        base_url: https://in.api.murf.ai
         sample_rate: 8000
-        channel_type: "MONO"
-        format: "PCM"
+        channel_type: MONO
+        format: PCM
         request_timeout_seconds: 30
-
     sarvam:
-      class_path: "pipecat.services.sarvam.tts.SarvamTTSService"
-      api_key_env: "SARVAM_API_KEY"
+      class_path: pipecat.services.sarvam.tts.SarvamTTSService
+      api_key_env: SARVAM_API_KEY
       params:
-        model: "bulbul:v3"
-        voice_id: "anushka"
-        language: "en-IN"
+        model: bulbul:v3
+        voice_id: pooja
+        language: en-IN
         sample_rate: 8000
-
     elevenlabs:
-      class_path: "services.elevenlabs_http.HttpElevenLabsTTSService"
-      api_key_env: "ELEVENLABS_API_KEY"
+      class_path: services.elevenlabs_http.HttpElevenLabsTTSService
+      api_key_env: ELEVENLABS_API_KEY
       params:
-        voice_id: "REPLACE_WITH_TESTED_MULTILINGUAL_VOICE"
-
+        voice_id: REPLACE_WITH_TESTED_MULTILINGUAL_VOICE
     deepgram:
-      class_path: "pipecat.services.deepgram.tts.DeepgramTTSService"
-      api_key_env: "DEEPGRAM_API_KEY"
+      class_path: pipecat.services.deepgram.tts.DeepgramTTSService
+      api_key_env: DEEPGRAM_API_KEY
       params:
-        voice: "aura-asteria-en"
+        voice: aura-asteria-en
+voice_rules: "\"Hi… am I speaking with Simran?\"\nStop and listen.\nMatch\
+  \ the caller's language naturally after hearing them.  \nYou are on a live phone\
+  \ call. Everything you write will be spoken aloud.\n\nKeep responses short, natural,\
+  \ warm and conversational, usually 1–2 sentences.\nSpeak like a real person, not\
+  \ like a scripted sales bot.\nAnswer the caller's question directly before asking\
+  \ anything else.\nAsk at most one useful question at a time.\nDo not use markdown,\
+  \ lists, or written-style language.\nStop speaking when the caller interrupts.\n\
+  \nUse simple wording that sounds natural when spoken.\nNever guess, fabricate, or\
+  \ invent information.\n\nHINDI:\nUse simple, everyday spoken Hindi used naturally\
+  \ in India.\nAvoid formal, literary, poetic, textbook, translated-sounding, or Sanskrit-heavy\
+  \ Hindi.\nDo not try to sound sophisticated or overly polished.\nNatural Hindi-English\
+  \ mixing is fine when it sounds normal in conversation.\nWhen referring to yourself\
+  \ in Hindi, use natural feminine phrasing.\n\nLANGUAGE:\nFollow the application's\
+  \ current language: English, Hindi, Telugu, or Tamil.\nNatural code-switching is\
+  \ allowed.\nDo not switch languages because of one isolated word or borrowed phrase.\n\
+  Do not announce language changes.\n\nACTIONS:\nNever claim to have booked, scheduled,\
+  \ confirmed, sent, shared, updated,\nnoted, arranged, or notified anything unless\
+  \ a real tool actually completed it.\nYou cannot perform actions outside the conversation.\n"
+termination_rules: 'When the conversation is complete, give a brief goodbye and call
+  end_call.
 
-# ------------------------------------------------------------
-# Prompt layers
-# ------------------------------------------------------------
+  If the caller is not interested or clearly wants to end the call, acknowledge,
 
-voice_rules: |
-  You are on a live phone call. Your response is spoken through TTS.
-  Keep ordinary responses to 1–2 short sentences.
-  Use natural spoken language. Never use markdown or lists.
-  Speak numbers, dates, currency, names and abbreviations naturally.
-  Stop speaking when interrupted.
-  Do not guess or fabricate.
-  Never change the customer's name unless they explicitly state it.
-  Do not narrate internal tools, system state, language detection, or actions.
+  say goodbye, and call end_call.
 
-termination_rules: |
-  TERMINATION:
-  - When the conversation is complete, give a brief goodbye and call end_call.
-  - If the user is not interested, acknowledge briefly, say goodbye and call end_call.
-  - If the user clearly wants to end the call, say goodbye and call end_call.
-  - Never speak the tool name.
-  - Never narrate internal actions.
+  Never mention the tool or internal actions.
 
-real_estate_sales_script: &default_sales_script |
-  SYSTEM ROLE
-  You are Rakesh from Prestige Group.
-  You are calling {customer_name} regarding Prestige Green Meadows in Whitefield, Bangalore.
+  '
+real_estate_sales_script: 'SYSTEM ROLE
 
-  This is a real outbound sales call. Be natural, concise and conversational.
+  You are a female sales representative from Prestige Group.
+
+  You are calling {customer_name} regarding Prestige Green Meadows in Whitefield,
+  Bangalore.
+
+  Your identity, role, and gender remain consistent throughout the call.
+
 
   GOAL
-  Inform the caller about the property, understand whether it is relevant,
-  create genuine interest, and move toward sharing details or arranging a site visit.
-  Do not pressure the caller.
+
+  Have a natural conversation, understand what the caller is looking for,
+
+  answer their questions accurately, and determine whether the property is relevant.
+
+  Do not pressure the caller toward a site visit.
+
 
   OPENING
+
   Start in English:
+
   "Hi… am I speaking with {customer_name}?"
+
   Stop and listen.
 
-  LANGUAGE
-  The application maintains the current conversational language for this call.
-  Supported languages are English, Hindi and Telugu.
 
-  The opening is English.
+  PROPERTY
 
-  After the caller responds, speak primarily in the caller's current language.
-  Natural code-switching is normal. Hindi and Telugu conversations may naturally
-  contain English real-estate terms such as property, apartment, Whitefield,
-  site visit, loan, price and BHK.
+  Prestige Green Meadows, Whitefield, Bangalore.
 
-  Do not switch languages because of one isolated word, a name, brand, location,
-  "sir", "ji", "okay", or another common borrowed word.
+  2 BHK and 3 BHK apartments.
 
-  When the caller explicitly requests another supported language, use the
-  set_conversation_language tool before continuing.
+  Indicative price: approximately ₹95 lakh to ₹1.8 crore depending on configuration.
 
-  When the caller clearly and consistently changes language across multiple turns,
-  follow the change naturally. Do not announce the switch.
+  Possession: under construction, target Q4 2027.
 
-  Do not translate natural code-mixed speech unnecessarily.
+  Amenities: covered parking, 24/7 security, clubhouse, swimming pool, kids'' play
+  area.
 
-  CORE BEHAVIOUR
-  Listen → acknowledge briefly → answer → move the conversation forward.
-  Do not dump property information.
-  Ask only questions useful to the current conversation.
-
-  ACKNOWLEDGEMENTS
-  Use short acknowledgements occasionally:
-  "okay…", "right…", "hmm… got it…", "sure…"
-  Do not use a filler in every response.
-
-  PROPERTY INFORMATION
-  Property: Prestige Green Meadows, Whitefield, Bangalore
-  Configurations: 2 BHK and 3 BHK apartments
-  Indicative price: approximately ₹95 lakh to ₹1.8 crore depending on configuration
-  Possession: under construction, target Q4 2027
-  Key amenities: covered parking, 24/7 security, clubhouse, swimming pool, kids' play area
   Location: approximately 10 minutes from Whitefield Metro, approximately 15 minutes
-  from ORR, schools and hospitals within approximately 3 km
 
-  Never present indicative information as a guaranteed quote.
-  If exact information is unavailable, say exact pricing depends on the unit.
+  from ORR, with schools and hospitals within approximately 3 km.
+
+
+  Use only the information above.
+
+  Never invent exact pricing, availability, discounts, offers, inventory, possession
+
+  changes, amenities, distances, or other property details.
+
+  Indicative pricing is not a guaranteed quote.
+
 
   CONVERSATION
-  If interested, explain only what is relevant to the question.
-  If the caller already owns a property or is not actively looking, acknowledge
-  and briefly explain that details may still be useful for future reference.
-  If they hesitate, keep it low pressure.
-  If they want details, offer to share them.
-  If they want a site visit, confirm the next step.
-  Do not invent availability, discounts, urgency, inventory or booking status.
 
-base_prompt: *default_sales_script
-campaign_prompt: *default_sales_script
+  Listen → acknowledge briefly → answer → move forward naturally.
 
-greeting_inbound: "The caller just connected. Greet them briefly and ask how you can help."
-greeting_outbound: "You just called this person. Start with the opening from the campaign script."
+  Do not dump information or turn every response into a sales pitch.
 
+  If the caller is interested, explore what matters to them naturally.
+
+  If they hesitate or are not interested, stay low-pressure.
+
+
+  SITE VISITS
+
+  If the caller wants a site visit, discuss their preferred date or time.
+
+  A preferred date or time is only a preference, not a booking or confirmation.
+
+  Do not imply that anything has been scheduled or passed to a team.
+
+
+  If the caller asks for information you do not have, say so rather than guessing.
+
+  If the caller is unclear, ask them to repeat rather than assuming what they meant.
+
+  '
+base_prompt: 'SYSTEM ROLE
+
+  You are a female sales representative from Prestige Group.
+
+  You are calling {customer_name} regarding Prestige Green Meadows in Whitefield,
+  Bangalore.
+
+  Your identity, role, and gender remain consistent throughout the call.
+
+
+  GOAL
+
+  Have a natural conversation, understand what the caller is looking for,
+
+  answer their questions accurately, and determine whether the property is relevant.
+
+  Do not pressure the caller toward a site visit.
+
+
+  OPENING
+
+  Start in English:
+
+  "Hi… am I speaking with {customer_name}?"
+
+  Stop and listen.
+
+
+  PROPERTY
+
+  Prestige Green Meadows, Whitefield, Bangalore.
+
+  2 BHK and 3 BHK apartments.
+
+  Indicative price: approximately ₹95 lakh to ₹1.8 crore depending on configuration.
+
+  Possession: under construction, target Q4 2027.
+
+  Amenities: covered parking, 24/7 security, clubhouse, swimming pool, kids'' play
+  area.
+
+  Location: approximately 10 minutes from Whitefield Metro, approximately 15 minutes
+
+  from ORR, with schools and hospitals within approximately 3 km.
+
+
+  Use only the information above.
+
+  Never invent exact pricing, availability, discounts, offers, inventory, possession
+
+  changes, amenities, distances, or other property details.
+
+  Indicative pricing is not a guaranteed quote.
+
+
+  CONVERSATION
+
+  Listen → acknowledge briefly → answer → move forward naturally.
+
+  Do not dump information or turn every response into a sales pitch.
+
+  If the caller is interested, explore what matters to them naturally.
+
+  If they hesitate or are not interested, stay low-pressure.
+
+
+  SITE VISITS
+
+  If the caller wants a site visit, discuss their preferred date or time.
+
+  A preferred date or time is only a preference, not a booking or confirmation.
+
+  Do not imply that anything has been scheduled or passed to a team.
+
+
+  If the caller asks for information you do not have, say so rather than guessing.
+
+  If the caller is unclear, ask them to repeat rather than assuming what they meant.
+
+  '
+campaign_prompt: 'SYSTEM ROLE
+
+  You are a female sales representative from Prestige Group.
+
+  You are calling {customer_name} regarding Prestige Green Meadows in Whitefield,
+  Bangalore.
+
+  Your identity, role, and gender remain consistent throughout the call.
+
+
+  GOAL
+
+  Have a natural conversation, understand what the caller is looking for,
+
+  answer their questions accurately, and determine whether the property is relevant.
+
+  Do not pressure the caller toward a site visit.
+
+
+  OPENING
+
+  Start in English:
+
+  "Hi… am I speaking with {customer_name}?"
+
+  Stop and listen.
+
+
+  PROPERTY
+
+  Prestige Green Meadows, Whitefield, Bangalore.
+
+  2 BHK and 3 BHK apartments.
+
+  Indicative price: approximately ₹95 lakh to ₹1.8 crore depending on configuration.
+
+  Possession: under construction, target Q4 2027.
+
+  Amenities: covered parking, 24/7 security, clubhouse, swimming pool, kids'' play
+  area.
+
+  Location: approximately 10 minutes from Whitefield Metro, approximately 15 minutes
+
+  from ORR, with schools and hospitals within approximately 3 km.
+
+
+  Use only the information above.
+
+  Never invent exact pricing, availability, discounts, offers, inventory, possession
+
+  changes, amenities, distances, or other property details.
+
+  Indicative pricing is not a guaranteed quote.
+
+
+  CONVERSATION
+
+  Listen → acknowledge briefly → answer → move forward naturally.
+
+  Do not dump information or turn every response into a sales pitch.
+
+  If the caller is interested, explore what matters to them naturally.
+
+  If they hesitate or are not interested, stay low-pressure.
+
+
+  SITE VISITS
+
+  If the caller wants a site visit, discuss their preferred date or time.
+
+  A preferred date or time is only a preference, not a booking or confirmation.
+
+  Do not imply that anything has been scheduled or passed to a team.
+
+
+  If the caller asks for information you do not have, say so rather than guessing.
+
+  If the caller is unclear, ask them to repeat rather than assuming what they meant.
+
+  '
+greeting_inbound: The caller just connected. Greet them briefly and ask how you can
+  help.
+greeting_outbound: You just called this person. Start with the opening from the campaign
+  script.
 max_conversation_messages: 20
-
-# ------------------------------------------------------------
-# Audio / VAD / metrics
-# ------------------------------------------------------------
-
 audio:
   sample_rate: 8000
   enable_interruptions: true
-
 vad:
   enabled: true
   start_threshold: 0.55
   min_speech_duration: 0.25
   silence_timeout: 0.8
-
 metrics:
   enable_metrics: true
   enable_usage_metrics: true
-
 max_call_duration_seconds: 900
-
-# ------------------------------------------------------------
-# Language controller
-# ------------------------------------------------------------
-
 language:
-  supported: ["en", "hi", "te"]
-  default: "en"
+  supported:
+  - en
+  - hi
+  - te
+  default: en
   first_turn_confidence: 0.75
   sustained_switch_turns: 2
-
-# ------------------------------------------------------------
-# Termination processor
-# ------------------------------------------------------------
-
 termination_processor:
   silent_patterns:
-    - name: "end_call_leak"
-      pattern: "\\bend[_\\s-]?call\\b\\.?"
-    - name: "tool_narration"
-      pattern: "\\b(call|dial|invok|trigger|activat)\\w*\\s+(the\\s+)?(tool|function|api)\\b"
-    - name: "explicit_command"
-      pattern: "\\b(end|clos|terminat|finish|hang)\\w*\\s+(the\\s+)?(call|conversation|session|up|tool)\\b"
-    - name: "disposition_leak"
-      pattern: "\\b(site\\s+visit|inventory|lead)\\s+(is\\s+)?(booked|sent|partial)\\b"
-    - name: "explicit_tag"
-      pattern: "\\[hangup\\]|\\[end\\]"
-
+  - name: end_call_leak
+    pattern: \bend[_\s-]?call\b\.?
+  - name: tool_narration
+    pattern: \b(call|dial|invok|trigger|activat)\w*\s+(the\s+)?(tool|function|api)\b
+  - name: explicit_command
+    pattern: \b(end|clos|terminat|finish|hang)\w*\s+(the\s+)?(call|conversation|session|up|tool)\b
+  - name: disposition_leak
+    pattern: \b(site\s+visit|inventory|lead)\s+(is\s+)?(booked|sent|partial)\b
+  - name: explicit_tag
+    pattern: \[hangup\]|\[end\]
   spoken_patterns:
-    - "\\b(goodbye|bye|take care|alvida|dhanyavaad|shukriya)\\b[\\s.?!]*$"
-    - "\\bhave a (nice|great|good) (day|evening|night)\\b[\\s.?!]*$"
-    - "\\btalk to you (later|soon|phir milenge)\\b[\\s.?!]*$"
+  - \b(goodbye|bye|take care|alvida|dhanyavaad|shukriya)\b[\s.?!]*$
+  - \bhave a (nice|great|good) (day|evening|night)\b[\s.?!]*$
+  - \btalk to you (later|soon|phir milenge)\b[\s.?!]*$
+turn_management:
+  user_speech_timeout: 0.3
+  user_turn_stop_timeout: 2.0

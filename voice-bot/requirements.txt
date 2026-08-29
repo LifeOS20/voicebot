@@ -5,7 +5,21 @@ loguru
 httpx
 pyyaml
 requests
-pipecat-ai[daily,deepgram,openai,elevenlabs,silero]
+# FIXED: added sarvam and groq extras — both are used by the configured
+# provider stacks (Stack A: Deepgram+Groq+Sarvam TTS, Stack B: Sarvam
+# STT+Groq+Murf) and weren't previously installed as dependencies at all.
+#
+# PINNED <2.0.0: verified directly against the installed package that
+# PipelineTask and PipelineRunner — which bot.py's entire execution model
+# is built on (every call constructs one of each) — are deprecated since
+# 1.3.0 and scheduled for removal in 2.0.0, in favor of PipelineWorker/
+# WorkerRunner. This isn't broken today (1.8.1 still fully supports them,
+# just with a deprecation warning), so no migration was done here — that
+# would be exactly the kind of speculative architectural change not asked
+# for. But an unpinned install would silently pull 2.0.0 the day it ships
+# and break the app outright. Plan a PipelineWorker/WorkerRunner migration
+# before ever lifting this ceiling.
+pipecat-ai[daily,deepgram,openai,elevenlabs,silero,sarvam,groq]<2.0.0,>=1.8.0
 redis
 
 # NOTE: torch, torchvision, torchaudio, transformers, and chatterbox-tts

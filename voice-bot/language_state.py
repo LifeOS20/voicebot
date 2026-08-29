@@ -8,7 +8,6 @@ The LLM can explicitly request a language change through the
 
 The application only owns:
 - current language
-- sustained-change candidate
 - confidence
 - switch history
 
@@ -20,20 +19,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
-LanguageCode = Literal["en", "hi", "te"]
+LanguageCode = Literal["en", "hi", "te", "ta"]
 
 SUPPORTED_LANGUAGES: frozenset[LanguageCode] = frozenset(
-    {"en", "hi", "te"}
+    {"en", "hi", "te", "ta"}
 )
 
 LANGUAGE_LOCALES: dict[LanguageCode, str] = {
     "en": "en-IN",
     "hi": "hi-IN",
     "te": "te-IN",
+    "ta": "ta-IN",
 }
 
-MIN_STT_CONFIDENCE = 0.75
-SUSTAINED_SWITCH_TURNS = 2
+MIN_STT_CONFIDENCE = 0.70
+
 
 
 @dataclass(frozen=True)
@@ -65,7 +65,12 @@ class LanguageState:
         language: Optional[str],
         confidence: Optional[float] = None,
     ) -> tuple[LanguageCode, bool]:
-        """Consume one finalized STT language observation."""
+        """Consume one finalized STT language observation.
+
+        A reliable provider-level language decision is applied immediately.
+        We do not wait for two turns because that creates a visible mismatch
+        when a caller intentionally switches languages.
+        """
         self.turn_index += 1
 
         detected = normalize_language(language)
@@ -82,44 +87,17 @@ class LanguageState:
             return self.current_language, False
 
         if detected == self.current_language:
-            self._clear_candidate()
             self.established = True
+            self._clear_candidate()
             return self.current_language, False
 
-        # The first reliable non-default language establishes preference.
-        # This prevents the first Hindi/Telugu caller turn from being answered
-        # in English.
-        if not self.established:
-            old = self.current_language
-            new = self._switch(
-                detected,
-                "initial_detection",
-                confidence_value,
-            )
-            return new, new != old
-
-        # Subsequent automatic changes require two consecutive turns.
-        if self.candidate_language == detected:
-            self.consecutive_candidate_turns += 1
-            self.candidate_confidence = max(
-                self.candidate_confidence,
-                confidence_value,
-            )
-        else:
-            self.candidate_language = detected
-            self.consecutive_candidate_turns = 1
-            self.candidate_confidence = confidence_value
-
-        if self.consecutive_candidate_turns >= SUSTAINED_SWITCH_TURNS:
-            old = self.current_language
-            new = self._switch(
-                detected,
-                "sustained_change",
-                self.candidate_confidence,
-            )
-            return new, new != old
-
-        return self.current_language, False
+        old = self.current_language
+        new = self._switch(
+            detected,
+            "initial_detection" if not self.established else "sustained_change",
+            confidence_value,
+        )
+        return new, new != old
 
     def set_explicit(
         self,
@@ -216,6 +194,8 @@ def normalize_language(
         return "hi"
     if base in {"te", "tel"}:
         return "te"
+    if base in {"ta", "tam"}:
+        return "ta"
 
     return None
 

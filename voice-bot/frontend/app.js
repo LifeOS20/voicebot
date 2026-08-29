@@ -4,61 +4,53 @@ let mediaStream = null;
 let workletNode = null;
 let isConnected = false;
 
-// Audio scheduling trackers
-let nextPlayTime = 0;
-let activeSourceNodes = [];
+const PLAYBACK_START_BUFFER_MS = 100;
 
-const callBtn = document.getElementById('callButton');
-const callBtnText = document.getElementById('callButtonText');
-const statusText = document.getElementById('status');
-const waveform = document.getElementById('waveform');
+const callBtn = document.getElementById("callButton");
+const callBtnText = document.getElementById("callButtonText");
+const statusText = document.getElementById("status");
+const waveform = document.getElementById("waveform");
 
-// Derive the WebSocket URL from the page itself, so this works both on
-// localhost AND once you host this frontend anywhere for a client demo.
-// FIXED: this used to be hardcoded to ws://localhost:8000/ws-web, which only
-// ever worked on the developer's own machine, and ws:// (not wss://) gets
-// blocked by the browser as mixed content the moment the page is served
-// over HTTPS (which almost every hosting provider does by default).
-//
-// If your frontend is hosted separately from the backend (e.g. Vercel for
-// the page, a VM for the FastAPI server), replace BACKEND_HOST below with
-// your backend's actual host:port instead of window.location.host.
-const BACKEND_HOST = window.location.host; // e.g. "localhost:8000" or "your-backend.example.com"
+const BACKEND_HOST = "localhost:8000";
 const WS_PROTOCOL = window.location.protocol === "https:" ? "wss:" : "ws:";
 const WS_URL = `${WS_PROTOCOL}//${BACKEND_HOST}/ws-web`;
 
-// Utility: convert Int16Array to Base64
 function int16ArrayToBase64(int16Array) {
-    const uint8Array = new Uint8Array(int16Array.buffer);
-    let binary = '';
-    for (let i = 0; i < uint8Array.byteLength; i++) {
-        binary += String.fromCharCode(uint8Array[i]);
+    const uint8Array = new Uint8Array(
+        int16Array.buffer,
+        int16Array.byteOffset,
+        int16Array.byteLength
+    );
+
+    let binary = "";
+    const chunkSize = 0x8000;
+
+    for (let offset = 0; offset < uint8Array.length; offset += chunkSize) {
+        const chunk = uint8Array.subarray(
+            offset,
+            Math.min(offset + chunkSize, uint8Array.length)
+        );
+        binary += String.fromCharCode(...chunk);
     }
+
     return btoa(binary);
 }
 
-// Utility: convert Base64 to Float32Array (for playing back)
-function base64ToFloat32Array(base64) {
+function base64ToInt16Array(base64) {
     const binary = atob(base64);
-    const len = binary.length;
-    const safeLen = len % 2 === 0 ? len : len - 1; // Ensure 16-bit alignment
-    
-    const bytes = new Uint8Array(safeLen);
-    for (let i = 0; i < safeLen; i++) {
+    const byteLength = binary.length - (binary.length % 2);
+    const bytes = new Uint8Array(byteLength);
+
+    for (let i = 0; i < byteLength; i++) {
         bytes[i] = binary.charCodeAt(i);
     }
-    
-    const int16 = new Int16Array(bytes.buffer);
-    const float32 = new Float32Array(int16.length);
-    for (let i = 0; i < int16.length; i++) {
-        float32[i] = int16[i] / 32768.0;
-    }
-    return float32;
+
+    return new Int16Array(bytes.buffer);
 }
 
 async function initCall() {
     statusText.innerText = "Requesting microphone permission...";
-    
+
     try {
         mediaStream = await navigator.mediaDevices.getUserMedia({
             audio: {
@@ -66,162 +58,205 @@ async function initCall() {
                 channelCount: 1,
                 echoCancellation: true,
                 noiseSuppression: true,
-                autoGainControl: true
-            }
+                autoGainControl: true,
+            },
         });
-        
-        audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-        
-        // Ensure context isn't suspended (Safari/Chrome strict autoplay policy fix)
-        if (audioContext.state === 'suspended') {
+
+        audioContext = new (
+            window.AudioContext || window.webkitAudioContext
+        )({
+            sampleRate: 16000,
+        });
+
+        if (audioContext.state === "suspended") {
             await audioContext.resume();
         }
-        
-        await audioContext.audioWorklet.addModule('audio-processor.js');
+
+        await audioContext.audioWorklet.addModule("audio-processor.js");
+
         const source = audioContext.createMediaStreamSource(mediaStream);
-        workletNode = new AudioWorkletNode(audioContext, 'voice-audio-processor');
-        
+
+        workletNode = new AudioWorkletNode(
+            audioContext,
+            "voice-audio-processor",
+            {
+                numberOfInputs: 1,
+                numberOfOutputs: 1,
+                outputChannelCount: [1],
+            }
+        );
+
         source.connect(workletNode);
         workletNode.connect(audioContext.destination);
 
-        statusText.innerText = `Connecting to voice agent...`;
-        console.log(`AudioContext Initialized. State: ${audioContext.state}, hardware SR: ${audioContext.sampleRate}`);
+        workletNode.port.onmessage = (event) => {
+            if (
+                event.data?.type === "audio" &&
+                ws &&
+                ws.readyState === WebSocket.OPEN
+            ) {
+                const base64Data = int16ArrayToBase64(event.data.audio);
 
-        ws = new WebSocket(WS_URL);
-        
-        ws.onopen = () => {
-             isConnected = true;
-             updateUIState(true);
-             statusText.innerText = "Connected - Say Hello!";
-             
-             // Message from audio processor: audio captured from mic, send to WebSocket
-             workletNode.port.onmessage = (event) => {
-                 if (event.data.type === 'audio' && ws.readyState === WebSocket.OPEN) {
-                     const base64Data = int16ArrayToBase64(event.data.audio);
-                     ws.send(JSON.stringify({
-                         event: "media",
-                         media: { payload: base64Data }
-                     }));
-                 }
-             };
+                ws.send(
+                    JSON.stringify({
+                        event: "media",
+                        media: {
+                            payload: base64Data,
+                            sampleRate: 16000,
+                        },
+                    })
+                );
+            }
         };
 
-        ws.onmessage = (event) => {
-             try {
+        statusText.innerText = "Connecting to voice agent...";
+
+        console.log(
+            `AudioContext initialized: state=${audioContext.state}, sampleRate=${audioContext.sampleRate}`
+        );
+
+        ws = new WebSocket(WS_URL);
+
+        ws.onopen = () => {
+            isConnected = true;
+            updateUIState(true);
+            statusText.innerText = "Connected - Say Hello!";
+        };
+
+        ws.onmessage = async (event) => {
+            try {
                 const data = JSON.parse(event.data);
-                if (data.event === 'playAudio' && data.media && data.media.payload) {
-                    const float32Data = base64ToFloat32Array(data.media.payload);
-                    const sampleRate = data.media.sampleRate || 16000;
-                    
-                    // console.log(`Received playing buffer: len=${float32Data.length}, SR=${sampleRate}`);
 
-                    if (audioContext.state === 'suspended') {
-                        audioContext.resume();
+                if (
+                    data.event === "playAudio" &&
+                    data.media &&
+                    data.media.payload
+                ) {
+                    if (!audioContext || audioContext.state === "closed") {
+                        return;
                     }
 
-                    // Schedule Native Audio Buffer
-                    const audioBuffer = audioContext.createBuffer(1, float32Data.length, sampleRate);
-                    audioBuffer.getChannelData(0).set(float32Data);
-                    
-                    const source = audioContext.createBufferSource();
-                    source.buffer = audioBuffer;
-                    source.connect(audioContext.destination);
-                    
-                    const currentTime = audioContext.currentTime;
-                    // Reset play time if the scheduled time is deeply in the past
-                    if (nextPlayTime < currentTime) {
-                        nextPlayTime = currentTime;
+                    if (audioContext.state === "suspended") {
+                        await audioContext.resume();
                     }
-                    
-                    source.start(nextPlayTime);
-                    nextPlayTime += audioBuffer.duration;
-                    
-                    activeSourceNodes.push(source);
-                    
-                    // Cleanup finished sources from array
-                    source.onended = () => {
-                         const index = activeSourceNodes.indexOf(source);
-                         if (index > -1) activeSourceNodes.splice(index, 1);
-                    };
 
-                    waveform.classList.add('active');
+                    const sampleRate = Number(
+                        data.media.sampleRate || audioContext.sampleRate
+                    );
+
+                    if (sampleRate !== audioContext.sampleRate) {
+                        console.warn(
+                            `Received audio at ${sampleRate} Hz, browser context is ${audioContext.sampleRate} Hz`
+                        );
+                    }
+
+                    const pcm = base64ToInt16Array(data.media.payload);
+
+                    workletNode.port.postMessage(
+                        {
+                            type: "playback",
+                            audio: pcm,
+                            sampleRate,
+                            startBufferMs: PLAYBACK_START_BUFFER_MS,
+                        },
+                        [pcm.buffer]
+                    );
+
+                    waveform.classList.add("active");
                     clearTimeout(window.waveformTimeout);
                     window.waveformTimeout = setTimeout(() => {
-                         waveform.classList.remove('active');
-                    }, Math.max(500, audioBuffer.duration * 1000)); 
+                        waveform.classList.remove("active");
+                    }, PLAYBACK_START_BUFFER_MS + 250);
                 }
-                if (data.event === 'clearAudio') {
-                     // The LLM was interrupted by the user! Stop all playing audio instantly.
-                     activeSourceNodes.forEach(s => {
-                         try { s.stop(); } catch(e) {}
-                     });
-                     activeSourceNodes = [];
-                     nextPlayTime = audioContext ? audioContext.currentTime : 0;
+
+                if (data.event === "clearAudio") {
+                    if (workletNode) {
+                        workletNode.port.postMessage({
+                            type: "clearPlayback",
+                        });
+                    }
+
+                    waveform.classList.remove("active");
                 }
-             } catch(e) {
-                console.error("Frame parse error:", e);
-             }
+            } catch (error) {
+                console.error("WebSocket audio frame error:", error);
+            }
         };
 
         ws.onclose = () => {
-             disconnectCall();
-             statusText.innerText = "Call ended.";
+            disconnectCall(false);
+            statusText.innerText = "Call ended.";
         };
 
-        ws.onerror = (e) => {
-             console.error("WebSocket Error:", e);
-             statusText.innerText = "Connection error. Is the backend running?";
-             disconnectCall();
+        ws.onerror = (error) => {
+            console.error("WebSocket error:", error);
+            statusText.innerText =
+                "Connection error. Is the backend running?";
+            disconnectCall(false);
         };
-
-    } catch (err) {
-        console.error("Initialization error:", err);
-        statusText.innerText = "Microphone access denied or error occurred.";
+    } catch (error) {
+        console.error("Initialization error:", error);
+        statusText.innerText =
+            "Microphone access denied or initialization failed.";
+        disconnectCall(false);
     }
 }
 
-function disconnectCall() {
+function disconnectCall(updateStatus = true) {
     isConnected = false;
     updateUIState(false);
-    
-    if (ws) {
-        ws.close();
-        ws = null;
-    }
-    
+
     if (workletNode) {
+        workletNode.port.postMessage({
+            type: "clearPlayback",
+        });
         workletNode.disconnect();
         workletNode = null;
     }
-    
+
+    if (ws) {
+        try {
+            ws.close();
+        } catch (error) {
+            console.debug("WebSocket close error:", error);
+        }
+        ws = null;
+    }
+
     if (audioContext) {
-        audioContext.close();
+        try {
+            audioContext.close();
+        } catch (error) {
+            console.debug("AudioContext close error:", error);
+        }
         audioContext = null;
     }
-    
+
     if (mediaStream) {
-        mediaStream.getTracks().forEach(track => track.stop());
+        mediaStream.getTracks().forEach((track) => track.stop());
         mediaStream = null;
     }
-    
-    waveform.classList.remove('active');
-    statusText.innerText = "Disconnected.";
+
+    waveform.classList.remove("active");
+
+    if (updateStatus) {
+        statusText.innerText = "Disconnected.";
+    }
 }
 
 function updateUIState(active) {
     if (active) {
-        callBtn.classList.remove('start-call');
-        callBtn.classList.add('end-call');
+        callBtn.classList.remove("start-call");
+        callBtn.classList.add("end-call");
         callBtnText.innerText = "End Call";
     } else {
-        callBtn.classList.remove('end-call');
-        callBtn.classList.add('start-call');
+        callBtn.classList.remove("end-call");
+        callBtn.classList.add("start-call");
         callBtnText.innerText = "Connect";
     }
 }
 
-// Attach listeners
-callBtn.addEventListener('click', () => {
+callBtn.addEventListener("click", () => {
     if (!isConnected) {
         initCall();
     } else {
@@ -229,5 +264,4 @@ callBtn.addEventListener('click', () => {
     }
 });
 
-// Setup initial UI states
 updateUIState(false);
