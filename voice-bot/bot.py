@@ -5,7 +5,7 @@ The bot deliberately does NOT contain a hand-written language classifier.
 
 Language decisions come from:
 1. multilingual STT metadata for automatic detection;
-2. the LLM's explicit set_conversation_language tool for intentional changes.
+2. narrow local detection of explicit caller language requests.
 
 LanguageState is per-call. TTS language changes use Pipecat's
 runtime TTSUpdateSettingsFrame so native and custom TTS providers follow the
@@ -18,6 +18,7 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import time
 from importlib import import_module
 from typing import Any, Optional
@@ -37,6 +38,7 @@ from pipecat.frames.frames import (
     LLMContextFrame,
     TTSUpdateSettingsFrame,
     TranscriptionFrame,
+    TextFrame,
     TTSSpeakFrame,
 )
 from pipecat.services.llm_service import FunctionCallParams
@@ -69,7 +71,6 @@ from language_state import (
 from prompt_builder import build_system_prompt
 from services.vobiz_serializer import VobizFrameSerializer
 from services.web_serializer import WebPCMFrameSerializer
-from termination_processor import TerminationProcessor
 from metrics_collector import CallMetricsCollector
 
 load_dotenv(override=True)
@@ -93,9 +94,8 @@ class LanguageObserver(FrameProcessor):
     1. reliable STT language metadata;
     2. an explicit language request in the caller's utterance.
 
-    Explicit requests are handled locally so they do not depend on the LLM
-    correctly deciding to call a tool. The registered LLM tool is still kept
-    for compatibility and explicit model-directed switches.
+    Explicit language requests are handled locally so language changes do not
+    depend on an LLM tool decision.
     """
 
     _LANGUAGE_LABELS = {
@@ -343,6 +343,13 @@ class LanguageObserver(FrameProcessor):
             "continue",
             "switch",
             "language",
+            "can you speak",
+            "please speak",
+            "speak in",
+            "speak to me in",
+            "talk in",
+            "reply in",
+            "answer in",
             "बोल",
             "बोलिए",
             "बोलो",
@@ -610,8 +617,27 @@ class ServiceFactory:
                 kwargs.update(top_level_params)
 
                 if settings_params:
-                    kwargs["settings"] = settings_cls(
-                        **settings_params
+                    # FIXED (critical): this used to call
+                    # `settings_cls(**settings_params)` directly. Pipecat's
+                    # Settings dataclasses only declare fields for the
+                    # options Pipecat itself knows about — anything
+                    # provider-specific that isn't a declared field (e.g.
+                    # Groq/qwen3's `reasoning_format` / `reasoning_effort`)
+                    # raises TypeError immediately on construction, which
+                    # means the ENTIRE service fails to build and the call
+                    # never starts. `from_mapping()` is Settings' own
+                    # documented classmethod for exactly this: known fields
+                    # go where they belong, anything unrecognized lands in
+                    # the settings object's `.extra` dict, which Pipecat's
+                    # OpenAI-compatible base client merges straight into the
+                    # outgoing API request body. Verified directly against
+                    # the installed pipecat-ai package: constructing
+                    # GroqLLMService.Settings(reasoning_format="hidden")
+                    # raises TypeError; .from_mapping({"reasoning_format":
+                    # "hidden"}) does not, and correctly places it in
+                    # .extra.
+                    kwargs["settings"] = settings_cls.from_mapping(
+                        settings_params
                     )
             else:
                 input_params_cls = getattr(
@@ -645,6 +671,71 @@ class ServiceFactory:
         )
 
 
+async def warmup_providers(config: dict) -> None:
+    """Pay the one-time provider cold-start cost at process startup instead
+    of on whichever call happens to arrive first.
+
+    LATENCY FIX (part of issue 2, "big gap before the bot speaks"): the call
+    logs show ~2.1s just constructing the Groq client
+    (`Creating llm provider=groq` -> `Creating Groq client with api ...`)
+    plus ~250ms loading the Silero VAD model, all landing on the very first
+    call served by a fresh worker process — the class imports underneath
+    `ServiceFactory._import_class()` (which pulls in the groq/openai/httpx
+    module chain) and the VAD model weights are only genuinely expensive the
+    first time, then cached by Python/torch for the rest of the process's
+    life. The old code paid that cost lazily, inside `run_bot()`, on the
+    first real caller. This pays it eagerly, before anyone can call in.
+
+    Wire this into your ASGI app's startup, e.g. in main.py:
+
+        from bot import warmup_providers
+
+        @app.on_event("startup")
+        async def _startup():
+            await warmup_providers(config)
+
+    (or the equivalent in a `lifespan` context manager, depending on your
+    FastAPI version). This does NOT construct real per-call STT/LLM/TTS
+    client instances — Sarvam/Deepgram's websocket-backed services are bound
+    to one call's audio stream and are not safe to share across concurrent
+    calls, so real construction still has to happen per call via
+    `_create_provider_services_in_parallel()` below. This only forces the
+    underlying classes (and the VAD model) to be resident in memory first.
+    """
+    provider_registry = config.get("providers", {})
+
+    class_paths = sorted(
+        {
+            provider_config["class_path"]
+            for providers_of_type in provider_registry.values()
+            for provider_config in providers_of_type.values()
+            if provider_config.get("class_path")
+        }
+    )
+
+    for class_path in class_paths:
+        try:
+            await asyncio.to_thread(
+                ServiceFactory._import_class,
+                class_path,
+            )
+        except Exception:
+            logger.exception(
+                "Warmup: failed to import {}",
+                class_path,
+            )
+
+    try:
+        await asyncio.to_thread(SileroVADAnalyzer)
+    except Exception:
+        logger.exception("Warmup: failed to prime Silero VAD")
+
+    logger.info(
+        "Warmup complete: {} provider classes imported",
+        len(class_paths),
+    )
+
+
 def _prune_history(
     messages: list,
     max_messages: int,
@@ -659,6 +750,99 @@ def _prune_history(
             -(max_messages - 1):
         ],
     ]
+
+
+class _SpokenTextGuard(FrameProcessor):
+    """Prevent internal orchestration text from reaching TTS.
+
+    IMPORTANT: this runs on raw, per-token streaming deltas from the LLM
+    (pipeline order is `llm -> spoken_text_guard -> tts`), not on complete
+    sentences. That constrains what this guard is allowed to do:
+
+    - It must never drop whitespace-only or punctuation-only deltas.
+      Those are normal, expected pieces of a streamed utterance (a comma
+      or a space is frequently its own delta), and TTS's own downstream
+      text aggregator depends on receiving *all* of them to reconstruct
+      correct spacing and pauses. A previous version of this guard treated
+      "no alphanumeric characters in this delta" as reason to drop it,
+      which silently deleted every space, comma, period, and question
+      mark the model streamed. That is what was producing run-on,
+      glued-together text like "have2 and3 BHK" / "late2027" reaching
+      TTS, and it was *worse* for Hindi: Devanagari vowel signs and other
+      combining marks (matras, nukta, candrabindu, etc.) are Unicode
+      combining characters, which Python's `str.isalnum()` reports as
+      non-alphanumeric even though they're linguistically part of the
+      word — so mid-word vowel sounds were being deleted from Hindi
+      output. Do not reintroduce an alnum-based filter here.
+    - The phrase/regex leak checks below are still safe to run per-delta:
+      a 1-3 character streaming fragment can never *contain* a full
+      leaked phrase like "you just called this person", so those checks
+      only ever fire once enough of a real leak has streamed through in a
+      single delta (which is the case they're meant to catch).
+    """
+
+    _INTERNAL_PHRASES = (
+        "you just called this person",
+        "the caller just connected",
+        "start with the opening from the campaign script",
+        "greet them briefly and ask how you can help",
+    )
+
+    _INTERNAL_REGEXES = (
+        r"^\s*(user|assistant|system|tool)\s*:",
+        r"\b(call|invoke|trigger|activate)\s+(the\s+)?[\w-]+\s+(tool|function|api)\b",
+    )
+
+    @staticmethod
+    def _text(frame: Frame) -> str:
+        value = getattr(frame, "text", None)
+        # Deliberately NOT stripped — see class docstring. Stripping a
+        # whitespace-only delta down to "" and then treating "" as
+        # droppable was how inter-word spacing was getting eaten.
+        return value if isinstance(value, str) else ""
+
+    @classmethod
+    def _is_blocked(cls, text: str) -> bool:
+        # Only a genuinely zero-length delta is unsafe to forward. A
+        # single space, comma, period, or combining mark is legitimate
+        # content and must pass through untouched.
+        if text == "":
+            return True
+
+        lowered = text.lower()
+
+        if any(phrase in lowered for phrase in cls._INTERNAL_PHRASES):
+            return True
+
+        if any(
+            re.search(pattern, text, re.IGNORECASE)
+            for pattern in cls._INTERNAL_REGEXES
+        ):
+            return True
+
+        return False
+
+    async def process_frame(
+        self,
+        frame: Frame,
+        direction: FrameDirection,
+    ) -> None:
+        await super().process_frame(frame, direction)
+
+        if (
+            direction == FrameDirection.DOWNSTREAM
+            and isinstance(frame, (TextFrame, TTSSpeakFrame))
+        ):
+            text = self._text(frame)
+
+            if self._is_blocked(text):
+                logger.warning(
+                    "SpokenTextGuard blocked unsafe/empty TTS text={!r}",
+                    text,
+                )
+                return
+
+        await self.push_frame(frame, direction)
 
 
 class _HistoryPruner(FrameProcessor):
@@ -768,6 +952,50 @@ async def run_bot(
     )
 
     # --------------------------------------------------------
+    # LATENCY FIX (issue 2, "big gap before the bot first speaks"):
+    #
+    # Neither the aiohttp session nor `_create_provider_services_in_parallel`
+    # depends on stream_id/call_id — only on `call_type` and `config`, both
+    # already available as function arguments. The previous version created
+    # the aiohttp session and awaited provider construction only AFTER the
+    # Vobiz handshake loop below finished, which made handshake wait time
+    # and provider cold-start time fully additive (serial), regardless of
+    # whether the caller said anything. Starting construction here lets it
+    # run concurrently with the handshake wait instead, so its ~2s+
+    # cold-start cost (see `warmup_providers()` above for the bigger
+    # structural fix — pre-warming at process startup) at least overlaps
+    # with, rather than stacks on top of, the handshake round-trip. This
+    # helps every call, not just the first one after a deploy.
+    # --------------------------------------------------------
+    aiohttp_session = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(
+            total=60,
+            connect=10,
+        ),
+        connector=aiohttp.TCPConnector(
+            limit=20,
+            ttl_dns_cache=300,
+        ),
+    )
+
+    active = config["active_providers"]
+
+    sample_rate = (
+        16000
+        if call_type == "web"
+        else config["audio"]["sample_rate"]
+    )
+
+    provider_construction_task = asyncio.create_task(
+        _create_provider_services_in_parallel(
+            config,
+            active,
+            sample_rate=sample_rate,
+            aiohttp_session=aiohttp_session,
+        )
+    )
+
+    # --------------------------------------------------------
     # Vobiz handshake
     # --------------------------------------------------------
     if not stream_id:
@@ -830,10 +1058,19 @@ async def run_bot(
             )
         )
 
+    # The browser/web transport is a test harness for the same outbound
+    # conversation. Keep the conversational semantics identical to Vobiz
+    # outbound calls. Audio transport remains "web"; only prompt/greeting
+    # semantics use the outbound campaign.
+    conversation_call_type = (
+        "outbound" if call_type == "web" else call_type
+    )
+
     logger.info(
-        "[{}] Starting {} call call_id={} providers={}",
+        "[{}] Starting transport={} conversation_type={} call_id={} providers={}",
         stream_id,
         call_type,
+        conversation_call_type,
         call_label,
         config.get(
             "active_providers",
@@ -924,24 +1161,9 @@ async def run_bot(
         level="DEBUG",
     )
 
-    aiohttp_session = aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(
-            total=60,
-            connect=10,
-        ),
-        connector=aiohttp.TCPConnector(
-            limit=20,
-            ttl_dns_cache=300,
-        ),
-    )
-
-    # Defaulted here (not just where it's actually constructed further
-    # down) so the outer finally block below can safely call
-    # call_metrics.finalize() even if something fails before service
-    # construction reaches that point — same reasoning already applied to
-    # log_handler/aiohttp_session above: referencing an unset local in a
-    # finally block raises UnboundLocalError and masks whatever the real
-    # failure was.
+    # aiohttp_session was already created above, before the handshake, so
+    # its construction overlaps with the handshake wait instead of
+    # following it.
     call_metrics = None
 
     try:
@@ -973,18 +1195,14 @@ async def run_bot(
                     ),
                     stop_secs=vad_config.get(
                         "silence_timeout",
-                        0.8,
+                        0.6,
                     ),
                     confidence=vad_config.get(
                         "start_threshold",
-                        0.55,
+                        0.6,
                     ),
                 )
             )
-
-        active = config[
-            "active_providers"
-        ]
 
         transport = FastAPIWebsocketTransport(
             websocket=websocket,
@@ -1002,18 +1220,9 @@ async def run_bot(
             ),
         )
 
-        sample_rate = (
-            16000
-            if call_type == "web"
-            else config["audio"]["sample_rate"]
-        )
-
-        stt, llm, tts = await _create_provider_services_in_parallel(
-            config,
-            active,
-            sample_rate=sample_rate,
-            aiohttp_session=aiohttp_session,
-        )
+        # Provider construction was kicked off before the handshake above —
+        # await it here. In the common case it has already finished by now.
+        stt, llm, tts = await provider_construction_task
 
         call_metrics = CallMetricsCollector(
             call_id=stream_id,
@@ -1022,34 +1231,83 @@ async def run_bot(
             tts_provider=active["tts"],
         )
 
-        language_state = LanguageState()
+        language_state = LanguageState(
+            # FIXED: config.yaml's language.sustained_switch_turns has
+            # existed the whole time but nothing ever read it -- the
+            # hysteresis threshold was hardcoded (and, before the
+            # language_state.py fix, not implemented at all). Now the value
+            # you actually set in config.yaml is the value that's used.
+            sustained_switch_turns=config.get("language", {}).get(
+                "sustained_switch_turns",
+                2,
+            ),
+        )
 
         shutdown_state = {
-            "active": False
-        }
-
-        end_call_pending = {
             "active": False
         }
 
         # ----------------------------------------------------
         # LLM tools
         # ----------------------------------------------------
+        def _latest_user_utterance() -> str:
+            for message in reversed(messages):
+                if message.get("role") == "user":
+                    content = message.get("content", "")
+                    return content.strip() if isinstance(content, str) else ""
+            return ""
+
         async def end_call(
             params: FunctionCallParams,
         ):
             tool_call_started_at = time.monotonic()
+            latest_user_text = _latest_user_utterance()
+
+            # Never allow the model to terminate an outbound call before the
+            # caller has actually spoken. This prevents an LLM/tool-call
+            # hallucination such as end_call("hello") from killing the call.
+            # This is the ONE guard we keep here — everything else about
+            # *when* it's appropriate to hang up is already carefully
+            # specified in `termination_rules` (config.yaml) and is the
+            # model's judgement call, not a keyword match.
+            #
+            # A previous version of this function additionally required the
+            # caller's latest utterance to contain one of a hardcoded list
+            # of English/Hindi termination phrases ("not interested", "bye",
+            # "बस", ...) before honoring the model's end_call tool call. That
+            # silently made it impossible for a Telugu or Tamil caller to
+            # ever end a call gracefully — no matter how clearly they asked
+            # to stop, the keyword gate would reject it and the call would
+            # only end via the 8-second forced-hangup fallback below. Rather
+            # than try to maintain a translated keyword list per supported
+            # language forever (which will always be incomplete), we trust
+            # the model's own judgement here, backed by the "no utterance
+            # yet" guard above and the very explicit termination_rules
+            # prompt.
+            if not latest_user_text:
+                logger.warning(
+                    "[{}] Rejected end_call before first caller utterance",
+                    stream_id,
+                )
+                await params.result_callback(
+                    {
+                        "status": "rejected",
+                        "reason": "no caller utterance yet",
+                    },
+                    properties=FunctionCallResultProperties(
+                        run_llm=True
+                    ),
+                )
+                return
+
             logger.info(
-                "[{}] end_call invoked language={}",
+                "[{}] end_call requested language={} latest_user_utterance={!r}",
                 stream_id,
                 language_state.current_language,
+                latest_user_text,
             )
 
             try:
-                end_call_pending[
-                    "active"
-                ] = True
-
                 if not shutdown_state[
                     "active"
                 ]:
@@ -1127,104 +1385,9 @@ async def run_bot(
                     latency_ms=(time.monotonic() - tool_call_started_at) * 1000,
                 )
 
-        async def set_conversation_language(
-            params: FunctionCallParams,
-        ):
-            tool_call_started_at = time.monotonic()
-            arguments = dict(
-                params.arguments
-            )
-
-            language = normalize_language(
-                arguments.get(
-                    "language"
-                )
-            )
-
-            reason = str(
-                arguments.get(
-                    "reason",
-                    "caller language preference changed",
-                )
-            )
-
-            if not language:
-                call_metrics.record_tool_call(
-                    "set_conversation_language",
-                    success=False,
-                    latency_ms=(time.monotonic() - tool_call_started_at) * 1000,
-                )
-                await params.result_callback(
-                    {
-                        "status": "rejected",
-                        "reason": "unsupported language",
-                    }
-                )
-                return
-
-            try:
-                new_language, switched = (
-                    language_state.set_explicit(
-                        language,
-                        reason,
-                    )
-                )
-
-                if switched:
-                    # Use the exact same runtime path as automatic language
-                    # detection so explicit LLM/tool switches cannot diverge.
-                    await language_observer._apply_language_change(
-                        new_language,
-                        "explicit_request_tool",
-                    )
-
-                call_metrics.record_tool_call(
-                    "set_conversation_language",
-                    success=True,
-                    latency_ms=(time.monotonic() - tool_call_started_at) * 1000,
-                )
-
-                await params.result_callback(
-                    {
-                        "status": (
-                            "changed"
-                            if switched
-                            else "already_active"
-                        ),
-                        "language": new_language,
-                    }
-                )
-
-            except Exception as exc:
-                call_metrics.record_tool_call(
-                    "set_conversation_language",
-                    success=False,
-                    latency_ms=(time.monotonic() - tool_call_started_at) * 1000,
-                )
-                logger.exception(
-                    "[{}] Language switch failed",
-                    stream_id,
-                )
-
-                await params.result_callback(
-                    {
-                        "status": "failed",
-                        "language": (
-                            language_state.current_language
-                        ),
-                        "error": str(exc),
-                    }
-                )
-
         llm.register_function(
             "end_call",
             end_call,
-            cancel_on_interruption=True,
-        )
-
-        llm.register_function(
-            "set_conversation_language",
-            set_conversation_language,
             cancel_on_interruption=True,
         )
 
@@ -1232,7 +1395,7 @@ async def run_bot(
         # Prompt/context
         # ----------------------------------------------------
         system_prompt = build_system_prompt(
-            call_type,
+            conversation_call_type,
             config,
             campaign_data,
         )
@@ -1253,59 +1416,18 @@ async def run_bot(
             .get("tools", [])
         )
 
-        # FIXED: the current Pipecat version's LLMContext requires actual
-        # FunctionSchema objects (or callables) in its `tools` list — a raw
-        # OpenAI-format dict, which is what config.yaml stores and what
-        # this used to pass straight through, raises TypeError on
-        # construction (verified directly against
-        # LLMContext._normalize_and_validate_tools). This converts
-        # config-driven tool definitions into the objects the current API
-        # actually requires, without changing config.yaml's shape or the
-        # handler-registration pattern below (register_function is
-        # unaffected and still the source of truth for behavior).
-        # Ensure the language-control tool is ALWAYS exposed to the LLM,
-        # even when config.yaml only contains end_call. Automatic STT/text
-        # detection remains authoritative, so the tool is a secondary path.
-        language_tool_present = any(
-            isinstance(raw, dict)
-            and raw.get("function", {}).get("name")
-            == "set_conversation_language"
+        # Language switching is handled locally from STT/transcript signals.
+        # Do not expose the model-directed language tool, even if an older
+        # config.yaml still contains it.
+        llm_tools_raw = [
+            raw
             for raw in llm_tools_raw
-        )
-        if not language_tool_present:
-            llm_tools_raw = [
-                *llm_tools_raw,
-                {
-                    "function": {
-                        "name": "set_conversation_language",
-                        "description": (
-                            "Change the conversation response language immediately "
-                            "when the caller explicitly asks to speak or continue "
-                            "in English, Hindi, Telugu, or Tamil."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "language": {
-                                    "type": "string",
-                                    "enum": [
-                                        "en",
-                                        "hi",
-                                        "te",
-                                        "ta",
-                                    ],
-                                },
-                                "reason": {
-                                    "type": "string",
-                                },
-                            },
-                            "required": [
-                                "language",
-                            ],
-                        },
-                    }
-                },
-            ]
+            if not (
+                isinstance(raw, dict)
+                and raw.get("function", {}).get("name")
+                == "set_conversation_language"
+            )
+        ]
 
         llm_tools = [
             FunctionSchema(
@@ -1339,9 +1461,14 @@ async def run_bot(
             user_params=LLMUserAggregatorParams(
                 user_turn_strategies=UserTurnStrategies(
                     start=[
-                        VADUserTurnStartStrategy(),
+                        VADUserTurnStartStrategy(
+                            enable_interruptions=True,
+                            enable_user_speaking_frames=True,
+                        ),
                         TranscriptionUserTurnStartStrategy(
                             use_interim=True,
+                            enable_interruptions=True,
+                            enable_user_speaking_frames=False,
                         ),
                     ],
                     stop=[
@@ -1349,7 +1476,7 @@ async def run_bot(
                             user_speech_timeout=float(
                                 turn_config.get(
                                     "user_speech_timeout",
-                                    0.30,
+                                    0.5,
                                 )
                             ),
                             wait_for_transcript=True,
@@ -1373,30 +1500,6 @@ async def run_bot(
             messages=messages,
         )
 
-        termination_config = config.get(
-            "termination_processor",
-            {},
-        )
-
-        termination_processor = (
-            TerminationProcessor(
-                shutdown_state=shutdown_state,
-                end_call_pending=end_call_pending,
-                stream_id=stream_id,
-                force_hangup_callback=(
-                    force_provider_hangup
-                ),
-                silent_patterns=termination_config.get(
-                    "silent_patterns",
-                    [],
-                ),
-                spoken_patterns=termination_config.get(
-                    "spoken_patterns",
-                    [],
-                ),
-            )
-        )
-
         history_pruner = _HistoryPruner(
             context=context,
             max_messages=config.get(
@@ -1406,6 +1509,8 @@ async def run_bot(
             stream_id=stream_id,
         )
 
+        spoken_text_guard = _SpokenTextGuard()
+
         pipeline = Pipeline(
             [
                 transport.input(),
@@ -1413,6 +1518,7 @@ async def run_bot(
                 language_observer,
                 context_aggregator.user(),
                 llm,
+                spoken_text_guard,
                 tts,
                 transport.output(),
                 context_aggregator.assistant(),
@@ -1469,53 +1575,74 @@ async def run_bot(
                 stream_id,
             )
 
-            if call_type == "vobiz":
-                # Production outbound behavior: the callee can speak first.
-                # Do not spend an LLM turn generating a greeting after answer.
-                # This removes the largest avoidable startup response delay.
-                logger.info(
-                    "[{}] Outbound call: listening immediately; "
-                    "skipping automatic greeting",
-                    stream_id,
-                )
-            else:
-                if (
-                    campaign_data
-                    and campaign_data.get(
-                        "greeting"
-                    )
-                ):
-                    customer_name = campaign_data.get(
-                        "customer_name",
-                        "there",
-                    )
+            # Resolve a real customer name where we have one. For the web
+            # test harness there is no campaign_data at all, so previously
+            # this always fell back to the literal string "there" —
+            # producing "Hi, am I speaking with there?" on every dev call.
+            # config.yaml already carries a `test_customer_name` for exactly
+            # this situation; use it instead of a fallback that only reads
+            # correctly when it happens to fill a real name slot.
+            customer_name = None
+            if campaign_data:
+                customer_name = campaign_data.get("customer_name")
+            if not customer_name and call_type == "web":
+                customer_name = config.get("test_customer_name")
 
-                    greeting = (
-                        campaign_data[
-                            "greeting"
-                        ].replace(
-                            "{customer_name}",
-                            customer_name,
-                        )
+            # Outbound is the conversation contract for both Vobiz outbound
+            # calls and the browser/web test harness. Never fall back to the
+            # inbound greeting for a web test.
+            if conversation_call_type == "outbound":
+                if customer_name:
+                    greeting_template = config.get(
+                        "greeting_outbound",
+                        "Hi, am I speaking with {customer_name}?",
+                    )
+                    greeting = str(greeting_template).replace(
+                        "{customer_name}",
+                        customer_name,
                     )
                 else:
-                    greeting = config.get(
-                        f"greeting_{call_type}",
-                        "Hi... am I speaking with there?",
+                    # No name available at all (e.g. misconfigured test
+                    # harness call). Use a fallback phrased so it's
+                    # grammatical without a name slot, instead of
+                    # substituting a placeholder word like "there" into a
+                    # template built for a name.
+                    greeting = str(
+                        config.get(
+                            "greeting_outbound_no_name",
+                            "Hi, is this a good time to talk?",
+                        )
                     )
-
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": greeting,
-                    }
+            else:
+                greeting = str(
+                    config.get(
+                        f"greeting_{conversation_call_type}",
+                        config.get(
+                            "greeting_inbound",
+                            "Hi, how can I help you?",
+                        ),
+                    )
                 )
 
+            # Speak the opening directly, and let Pipecat's own assistant
+            # context aggregator record it into `messages` via
+            # append_to_context=True. Do NOT also manually append it to
+            # `messages` here: a previous version did both, and the
+            # aggregator recording the same TTSSpeakFrame text a second
+            # time was producing two identical assistant turns in context
+            # before the caller ever said a word (visible directly in call
+            # logs), inflating every subsequent LLM request for the whole
+            # call. There should be exactly one source of truth for what
+            # was spoken.
+            #
+            # Requires a pipecat-ai version that supports
+            # TTSSpeakFrame(append_to_context=...). Check `pip show
+            # pipecat-ai` if this argument is rejected; upgrading is the
+            # right move either way; this exact class of duplicate-context
+            # bug has had multiple fixes land upstream.
             await task.queue_frames(
                 [
-                    LLMContextFrame(
-                        context=context
-                    )
+                    TTSSpeakFrame(text=greeting, append_to_context=True),
                 ]
             )
 

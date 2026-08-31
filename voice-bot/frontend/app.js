@@ -16,7 +16,7 @@ const WS_PROTOCOL = window.location.protocol === "https:" ? "wss:" : "ws:";
 const WS_URL = `${WS_PROTOCOL}//${BACKEND_HOST}/ws-web`;
 
 function int16ArrayToBase64(int16Array) {
-    const uint8Array = new Uint8Array(
+    const bytes = new Uint8Array(
         int16Array.buffer,
         int16Array.byteOffset,
         int16Array.byteLength
@@ -25,10 +25,10 @@ function int16ArrayToBase64(int16Array) {
     let binary = "";
     const chunkSize = 0x8000;
 
-    for (let offset = 0; offset < uint8Array.length; offset += chunkSize) {
-        const chunk = uint8Array.subarray(
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+        const chunk = bytes.subarray(
             offset,
-            Math.min(offset + chunkSize, uint8Array.length)
+            Math.min(offset + chunkSize, bytes.length)
         );
         binary += String.fromCharCode(...chunk);
     }
@@ -112,7 +112,7 @@ async function initCall() {
         statusText.innerText = "Connecting to voice agent...";
 
         console.log(
-            `AudioContext initialized: state=${audioContext.state}, sampleRate=${audioContext.sampleRate}`
+            `AudioContext: state=${audioContext.state}, sampleRate=${audioContext.sampleRate}`
         );
 
         ws = new WebSocket(WS_URL);
@@ -127,10 +127,22 @@ async function initCall() {
             try {
                 const data = JSON.parse(event.data);
 
+                // Backend tells us an interruption happened.
+                // CRITICAL: clear the browser playback queue immediately.
+                if (data.event === "clearAudio") {
+                    if (workletNode) {
+                        workletNode.port.postMessage({
+                            type: "clearPlayback",
+                        });
+                    }
+
+                    waveform.classList.remove("active");
+                    return;
+                }
+
                 if (
                     data.event === "playAudio" &&
-                    data.media &&
-                    data.media.payload
+                    data.media?.payload
                 ) {
                     if (!audioContext || audioContext.state === "closed") {
                         return;
@@ -140,17 +152,14 @@ async function initCall() {
                         await audioContext.resume();
                     }
 
-                    const sampleRate = Number(
-                        data.media.sampleRate || audioContext.sampleRate
-                    );
-
-                    if (sampleRate !== audioContext.sampleRate) {
-                        console.warn(
-                            `Received audio at ${sampleRate} Hz, browser context is ${audioContext.sampleRate} Hz`
-                        );
-                    }
+                    const sampleRate =
+                        Number(data.media.sampleRate) || 16000;
 
                     const pcm = base64ToInt16Array(data.media.payload);
+
+                    if (!pcm.length || !workletNode) {
+                        return;
+                    }
 
                     workletNode.port.postMessage(
                         {
@@ -163,23 +172,18 @@ async function initCall() {
                     );
 
                     waveform.classList.add("active");
+
                     clearTimeout(window.waveformTimeout);
+
                     window.waveformTimeout = setTimeout(() => {
                         waveform.classList.remove("active");
                     }, PLAYBACK_START_BUFFER_MS + 250);
                 }
-
-                if (data.event === "clearAudio") {
-                    if (workletNode) {
-                        workletNode.port.postMessage({
-                            type: "clearPlayback",
-                        });
-                    }
-
-                    waveform.classList.remove("active");
-                }
             } catch (error) {
-                console.error("WebSocket audio frame error:", error);
+                console.error(
+                    "WebSocket audio frame error:",
+                    error
+                );
             }
         };
 
@@ -190,14 +194,18 @@ async function initCall() {
 
         ws.onerror = (error) => {
             console.error("WebSocket error:", error);
+
             statusText.innerText =
                 "Connection error. Is the backend running?";
+
             disconnectCall(false);
         };
     } catch (error) {
         console.error("Initialization error:", error);
+
         statusText.innerText =
             "Microphone access denied or initialization failed.";
+
         disconnectCall(false);
     }
 }
@@ -210,6 +218,7 @@ function disconnectCall(updateStatus = true) {
         workletNode.port.postMessage({
             type: "clearPlayback",
         });
+
         workletNode.disconnect();
         workletNode = null;
     }
@@ -218,8 +227,12 @@ function disconnectCall(updateStatus = true) {
         try {
             ws.close();
         } catch (error) {
-            console.debug("WebSocket close error:", error);
+            console.debug(
+                "WebSocket close error:",
+                error
+            );
         }
+
         ws = null;
     }
 
@@ -227,16 +240,24 @@ function disconnectCall(updateStatus = true) {
         try {
             audioContext.close();
         } catch (error) {
-            console.debug("AudioContext close error:", error);
+            console.debug(
+                "AudioContext close error:",
+                error
+            );
         }
+
         audioContext = null;
     }
 
     if (mediaStream) {
-        mediaStream.getTracks().forEach((track) => track.stop());
+        mediaStream
+            .getTracks()
+            .forEach((track) => track.stop());
+
         mediaStream = null;
     }
 
+    clearTimeout(window.waveformTimeout);
     waveform.classList.remove("active");
 
     if (updateStatus) {
@@ -248,10 +269,12 @@ function updateUIState(active) {
     if (active) {
         callBtn.classList.remove("start-call");
         callBtn.classList.add("end-call");
+
         callBtnText.innerText = "End Call";
     } else {
         callBtn.classList.remove("end-call");
         callBtn.classList.add("start-call");
+
         callBtnText.innerText = "Connect";
     }
 }

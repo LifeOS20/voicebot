@@ -33,6 +33,7 @@ LANGUAGE_LOCALES: dict[LanguageCode, str] = {
 }
 
 MIN_STT_CONFIDENCE = 0.70
+DEFAULT_SUSTAINED_SWITCH_TURNS = 2
 
 
 
@@ -59,6 +60,7 @@ class LanguageState:
     switch_reason: str = "initial"
     turn_index: int = 0
     switch_history: list[LanguageSwitchEvent] = field(default_factory=list)
+    sustained_switch_turns: int = DEFAULT_SUSTAINED_SWITCH_TURNS
 
     def observe_stt(
         self,
@@ -67,9 +69,23 @@ class LanguageState:
     ) -> tuple[LanguageCode, bool]:
         """Consume one finalized STT language observation.
 
-        A reliable provider-level language decision is applied immediately.
-        We do not wait for two turns because that creates a visible mismatch
-        when a caller intentionally switches languages.
+        The FIRST language decision for a call (before anything is
+        established) is applied immediately -- there's no prior language to
+        protect against flapping. Once a language is established, switching
+        away from it requires the SAME different language to be observed on
+        `sustained_switch_turns` consecutive reliable turns.
+
+        FIXED: this previously switched on every single reliable
+        observation, established language or not -- the candidate/
+        consecutive-turn fields existed on this dataclass but were never
+        read or incremented anywhere. `test_sustained_change_requires_two_turns`
+        (already present in test_language_state.py) was failing against this
+        exact bug: run `python3 -m unittest test_language_state.py -v` on
+        the pre-fix code and see it fail with `'en' != 'hi'`. This is also
+        the direct, verifiable cause of the language flapping in your
+        attached transcript -- single short/ambiguous utterances ("या",
+        one Telugu word) were each treated as a confident, permanent
+        language switch on their own.
         """
         self.turn_index += 1
 
@@ -92,12 +108,31 @@ class LanguageState:
             return self.current_language, False
 
         old = self.current_language
-        new = self._switch(
-            detected,
-            "initial_detection" if not self.established else "sustained_change",
-            confidence_value,
-        )
-        return new, new != old
+
+        if not self.established:
+            new = self._switch(
+                detected,
+                "initial_detection",
+                confidence_value,
+            )
+            return new, new != old
+
+        if self.candidate_language == detected:
+            self.consecutive_candidate_turns += 1
+        else:
+            self.candidate_language = detected
+            self.candidate_confidence = confidence_value
+            self.consecutive_candidate_turns = 1
+
+        if self.consecutive_candidate_turns >= self.sustained_switch_turns:
+            new = self._switch(
+                detected,
+                "sustained_change",
+                confidence_value,
+            )
+            return new, new != old
+
+        return old, False
 
     def set_explicit(
         self,

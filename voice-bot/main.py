@@ -74,6 +74,40 @@ class CallManager:
 CONFIG = None
 CALL_MANAGER = CallManager()
 
+# ------------------------------------------------------------------
+# Concurrency cap
+# ------------------------------------------------------------------
+# There was no admission control anywhere in this file: no semaphore, no
+# active-call counter, no limit on simultaneous WebSocket connections. Under
+# real concurrent load this doesn't fail one excess call gracefully -- it
+# keeps accepting connections and constructing full pipelines (STT+LLM+TTS+
+# VAD, each with a real provider connection) until something physically
+# gives out (process memory, file descriptors, or a provider's own
+# account-level concurrency limit), which risks destabilizing the whole
+# process and taking every call in progress down at once, not just the one
+# that tipped it over.
+#
+# Safe to do with a plain int (no asyncio.Lock needed): the check-then-
+# increment below has no `await` between the read and the write, so nothing
+# else can run on this single-threaded event loop in between. Size
+# MAX_CONCURRENT_CALLS from an actual load test against your real provider
+# stack -- 50 is a placeholder starting point, not a measured number.
+MAX_CONCURRENT_CALLS = int(os.getenv("MAX_CONCURRENT_CALLS", "50"))
+_active_calls = 0
+
+
+def _try_acquire_call_slot() -> bool:
+    global _active_calls
+    if _active_calls >= MAX_CONCURRENT_CALLS:
+        return False
+    _active_calls += 1
+    return True
+
+
+def _release_call_slot() -> None:
+    global _active_calls
+    _active_calls = max(0, _active_calls - 1)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -306,6 +340,17 @@ async def websocket_endpoint(websocket: WebSocket):
     # We read that message -> set stream_id="abc-123" -> Bot starts talking.
     stream_id = None
 
+    if not _try_acquire_call_slot():
+        logger.warning(
+            f"At capacity ({MAX_CONCURRENT_CALLS} concurrent calls) -- "
+            f"rejecting new {call_type} connection"
+        )
+        # 1013 = RFC 6455 "Try Again Later". The provider's own retry/
+        # failover behavior on a rejected stream is provider-specific --
+        # confirm Vobiz's behavior here before relying on it in production.
+        await websocket.close(code=1013, reason="At capacity")
+        return
+
     try:
         # 1. Do NOT manually read the first message here.
         # We pass stream_id=None to bot.py, which handles the Vobiz handshake.
@@ -342,6 +387,7 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"[{stream_id}] WebSocket error ({call_type}): {e}")
     finally:
+        _release_call_slot()
         logger.info(f"[{stream_id}] WebSocket closed ({call_type})")
 
 # WEB BROWSER WEBSOCKET ENDPOINT (NO TELEPHONY)
@@ -366,6 +412,14 @@ async def websocket_web_endpoint(websocket: WebSocket):
     # call_id is already generated for outbound calls elsewhere in this file.
     stream_id = f"web-{uuid.uuid4()}"
 
+    if not _try_acquire_call_slot():
+        logger.warning(
+            f"At capacity ({MAX_CONCURRENT_CALLS} concurrent calls) -- "
+            f"rejecting new web connection"
+        )
+        await websocket.close(code=1013, reason="At capacity")
+        return
+
     try:
         max_duration = CONFIG.get("max_call_duration_seconds", 900)
 
@@ -387,6 +441,7 @@ async def websocket_web_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"[{stream_id}] Web WebSocket error: {e}")
     finally:
+        _release_call_slot()
         logger.info(f"[{stream_id}] Web WebSocket closed")
 
 
@@ -396,7 +451,12 @@ async def websocket_web_endpoint(websocket: WebSocket):
 async def health():
     # Health check endpoint reports which services are configured
     active = CONFIG.get("active_providers", {})
-    return {"status": "healthy", "configured_services": active}
+    return {
+        "status": "healthy",
+        "configured_services": active,
+        "active_calls": _active_calls,
+        "max_concurrent_calls": MAX_CONCURRENT_CALLS,
+    }
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))

@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import io
-import wave
+import struct
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -24,12 +22,136 @@ from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService
 
 
+class _IncrementalRiffParser:
+    """Strips a WAV/RIFF container from a byte stream as it arrives, without
+    ever needing the complete file in memory.
+
+    FIXED (critical latency bug): the previous implementation called
+    `wave.open(io.BytesIO(audio_bytes), "rb")` on the response body. The
+    stdlib `wave` module requires a complete, seekable buffer to do that --
+    it reads the RIFF size field and seeks to pull out frame counts -- so
+    the calling code had no choice but to buffer Murf's *entire* response
+    with `await response.read()` before it could parse anything or emit a
+    single frame of audio. That's why time-to-first-audio for Murf was
+    effectively "however long the whole utterance takes to synthesize and
+    download," not "however long the first chunk takes."
+
+    This class does the one thing `wave` can't: walk RIFF subchunks
+    incrementally as bytes arrive over the wire, so raw PCM payload bytes
+    can be handed off the moment they're available, chunk to chunk. It
+    still recovers the real sample rate and channel count from the `fmt `
+    subchunk when one is present -- Murf's docs note it can return WAV
+    container bytes even when PCM was requested, so that check is preserved
+    exactly, not relaxed.
+
+    Usage: call `feed(chunk)` for each network chunk as it arrives; it
+    returns whatever newly-available raw PCM bytes that chunk unlocked
+    (empty bytes while still buffering header). After the stream ends, call
+    `flush()` for any tail bytes still held internally (there normally
+    aren't any once `data_started` is True, since `feed` hands off
+    everything immediately at that point -- `flush` exists purely so a
+    malformed/truncated response can't silently lose its last few bytes).
+    """
+
+    # Never scan more than this many header bytes before giving up on
+    # detecting a container and just treating everything as raw PCM. A real
+    # WAV header for this use case (mono 16-bit PCM, a handful of standard
+    # subchunks) is well under 100 bytes; this is a generous safety margin,
+    # not a tuned value -- it exists so a malformed response can't stall
+    # first-audio forever waiting for a `data` marker that never comes.
+    MAX_HEADER_SCAN_BYTES = 4096
+
+    def __init__(self) -> None:
+        self._header_buf = bytearray()
+        self._offset = 0
+        self.data_started = False
+        self.is_wav: bool | None = None  # None = not yet determined
+        self.sample_rate: int | None = None
+        self.channels: int | None = None
+
+    def feed(self, chunk: bytes) -> bytes:
+        if self.data_started:
+            return chunk
+
+        self._header_buf.extend(chunk)
+
+        if self.is_wav is None:
+            if len(self._header_buf) < 12:
+                return b""  # not enough yet to even check the magic bytes
+            self.is_wav = (
+                self._header_buf[:4] == b"RIFF"
+                and self._header_buf[8:12] == b"WAVE"
+            )
+            if not self.is_wav:
+                # Not a RIFF container at all -- Murf returned raw PCM
+                # directly. Everything buffered so far, plus everything
+                # from here on, is audio payload.
+                pending = bytes(self._header_buf)
+                self._header_buf = bytearray()
+                self.data_started = True
+                return pending
+            self._offset = 12
+
+        # Walk subchunks: 4-byte ID + 4-byte little-endian size + payload
+        # (word-padded). Stop as soon as `data` is found, or as soon as we
+        # run out of buffered bytes to safely parse the next subchunk header.
+        while True:
+            if len(self._header_buf) - self._offset < 8:
+                break  # need more bytes for the next subchunk header
+
+            subchunk_id = bytes(self._header_buf[self._offset : self._offset + 4])
+            (subchunk_size,) = struct.unpack_from(
+                "<I", self._header_buf, self._offset + 4
+            )
+            payload_start = self._offset + 8
+
+            if subchunk_id == b"data":
+                # Found it. Everything from here to the end of what we've
+                # buffered is already audio payload; hand it all off now.
+                pending = bytes(self._header_buf[payload_start:])
+                self._header_buf = bytearray()
+                self.data_started = True
+                return pending
+
+            if len(self._header_buf) - payload_start < subchunk_size:
+                break  # this subchunk's payload hasn't fully arrived yet
+
+            if subchunk_id == b"fmt " and subchunk_size >= 16:
+                # AudioFormat(2) NumChannels(2) SampleRate(4) ...
+                self.channels, self.sample_rate = struct.unpack_from(
+                    "<xxHI", self._header_buf, payload_start
+                )
+
+            self._offset = payload_start + subchunk_size + (subchunk_size & 1)
+
+        if len(self._header_buf) > self.MAX_HEADER_SCAN_BYTES:
+            logger.warning(
+                "Murf TTS: no RIFF 'data' subchunk found in first {} bytes; "
+                "treating buffered response as raw PCM instead of stalling.",
+                len(self._header_buf),
+            )
+            pending = bytes(self._header_buf)
+            self._header_buf = bytearray()
+            self.data_started = True
+            return pending
+
+        return b""
+
+    def flush(self) -> bytes:
+        if self._header_buf:
+            pending = bytes(self._header_buf)
+            self._header_buf = bytearray()
+            return pending
+        return b""
+
+
 class MurfFalcon2TTSService(TTSService):
     """Murf Falcon 2 HTTP TTS service.
 
     Murf's streaming endpoint may return WAV container bytes even when the
     requested synthesis format is PCM. This adapter normalizes the response
-    to raw mono PCM before emitting TTSAudioRawFrame objects downstream.
+    to raw mono PCM before emitting TTSAudioRawFrame objects downstream --
+    incrementally, as bytes arrive, never buffering the full response first.
     """
 
     def __init__(
@@ -128,49 +250,18 @@ class MurfFalcon2TTSService(TTSService):
 
         logger.info("Murf TTS language changed to {}", locale)
 
-    @staticmethod
-    def _wav_to_pcm(
-        audio_bytes: bytes,
-    ) -> tuple[bytes, int, int]:
-        """Convert a WAV container into raw PCM bytes.
-
-        Returns:
-            (pcm_bytes, sample_rate, channel_count)
-        """
-        with wave.open(io.BytesIO(audio_bytes), "rb") as wav:
-            channels = wav.getnchannels()
-            sample_rate = wav.getframerate()
-            sample_width = wav.getsampwidth()
-            pcm = wav.readframes(wav.getnframes())
-
-        if sample_width != 2:
-            raise ValueError(
-                f"Unsupported Murf WAV sample width: {sample_width * 8}-bit; "
-                "expected 16-bit PCM."
-            )
-
-        return pcm, sample_rate, channels
-
-    @staticmethod
-    def _strip_known_container(audio_bytes: bytes) -> tuple[bytes, int | None, int | None]:
-        """Return raw PCM if bytes contain a WAV container.
-
-        For non-WAV bytes, return the original bytes and unknown metadata.
-        """
-        if audio_bytes[:4] != b"RIFF" or audio_bytes[8:12] != b"WAVE":
-            return audio_bytes, None, None
-
-        pcm, sample_rate, channels = MurfFalcon2TTSService._wav_to_pcm(
-            audio_bytes
-        )
-        return pcm, sample_rate, channels
-
     async def run_tts(
         self,
         text: str,
         context_id: str,
     ) -> AsyncGenerator[Frame | None, None]:
-        """Synthesize one utterance and emit playable raw PCM frames."""
+        """Synthesize one utterance and emit playable raw PCM frames.
+
+        Streams audio downstream as it arrives from Murf, chunk by chunk --
+        it never waits for the full response before yielding the first
+        frame. See `_IncrementalRiffParser` for why that was previously
+        impossible with a WAV-container response.
+        """
         text = (text or "").strip()
 
         if not text:
@@ -258,74 +349,88 @@ class MurfFalcon2TTSService(TTSService):
 
                 yield TTSStartedFrame(context_id=context_id)
 
-                # Murf's endpoint has returned WAV content in our validated
-                # direct API test. Read the response as one audio payload,
-                # normalize the container if required, then emit PCM.
-                audio_bytes = await response.read()
+                # Stream the response as it arrives instead of buffering it.
+                # `_IncrementalRiffParser` strips a WAV container (if Murf
+                # sent one) chunk by chunk, so the first playable PCM bytes
+                # can be emitted as soon as they're available -- not after
+                # the entire utterance has finished downloading.
+                parser = _IncrementalRiffParser()
+                pending = bytearray()
+                chunk_size = 4096
+                total_network_bytes = 0
+                total_pcm_bytes = 0
 
-                if not audio_bytes:
+                async for network_chunk in response.content.iter_chunked(8192):
+                    if not network_chunk:
+                        continue
+
+                    total_network_bytes += len(network_chunk)
+                    pending.extend(parser.feed(network_chunk))
+
+                    while len(pending) >= chunk_size:
+                        piece = bytes(pending[:chunk_size])
+                        del pending[:chunk_size]
+                        total_pcm_bytes += len(piece)
+
+                        if first_audio:
+                            await self.stop_ttfb_metrics()
+                            first_audio = False
+
+                        yield TTSAudioRawFrame(
+                            audio=piece,
+                            sample_rate=(parser.sample_rate or runtime_sample_rate),
+                            num_channels=1,
+                            context_id=context_id,
+                        )
+
+                # Flush whatever's left: a final short chunk from the loop
+                # above, plus anything the parser was still holding if the
+                # stream ended before a `data` subchunk was ever found
+                # (malformed/empty response).
+                pending.extend(parser.flush())
+
+                if pending:
+                    total_pcm_bytes += len(pending)
+
+                    if first_audio:
+                        await self.stop_ttfb_metrics()
+                        first_audio = False
+
+                    yield TTSAudioRawFrame(
+                        audio=bytes(pending),
+                        sample_rate=(parser.sample_rate or runtime_sample_rate),
+                        num_channels=1,
+                        context_id=context_id,
+                    )
+
+                if total_pcm_bytes == 0:
                     logger.error("Murf TTS returned an empty audio response.")
                     yield ErrorFrame(
                         error="Murf TTS returned empty audio"
                     )
                     return
 
-                pcm_bytes, returned_sample_rate, returned_channels = (
-                    self._strip_known_container(audio_bytes)
-                )
-
-                output_sample_rate = (
-                    returned_sample_rate or runtime_sample_rate
-                )
-                output_channels = returned_channels or 1
-
-                if output_channels != 1:
+                if parser.channels is not None and parser.channels != 1:
                     logger.error(
                         "Murf TTS returned {} channels; expected mono.",
-                        output_channels,
+                        parser.channels,
                     )
                     yield ErrorFrame(
                         error=(
-                            f"Murf TTS returned {output_channels} channels; "
+                            f"Murf TTS returned {parser.channels} channels; "
                             "mono output required"
                         )
                     )
                     return
 
-                if first_audio:
-                    await self.stop_ttfb_metrics()
-                    first_audio = False
-
                 logger.debug(
-                    "Murf TTS audio received bytes={} pcm_bytes={} "
-                    "sample_rate={} channels={}",
-                    len(audio_bytes),
-                    len(pcm_bytes),
-                    output_sample_rate,
-                    output_channels,
+                    "Murf TTS audio streamed network_bytes={} pcm_bytes={} "
+                    "sample_rate={} is_wav={}",
+                    total_network_bytes,
+                    total_pcm_bytes,
+                    parser.sample_rate or runtime_sample_rate,
+                    parser.is_wav,
                 )
-
-                # Emit reasonably sized PCM chunks downstream.
-                chunk_size = 4096
-
-                for offset in range(
-                    0,
-                    len(pcm_bytes),
-                    chunk_size,
-                ):
-                    chunk = pcm_bytes[
-                        offset : offset + chunk_size
-                    ]
-
-                    if not chunk:
-                        continue
-
-                    yield TTSAudioRawFrame(
-                        audio=chunk,
-                        sample_rate=output_sample_rate,
-                        num_channels=1,
-                        context_id=context_id,
-                    )
 
         except asyncio.CancelledError:
             # Normal path during interruption/barge-in or call cancellation.
@@ -341,7 +446,7 @@ class MurfFalcon2TTSService(TTSService):
                 error="Murf TTS network or timeout failure"
             )
 
-        except (wave.Error, ValueError) as exc:
+        except (struct.error, ValueError) as exc:
             logger.error(
                 "Murf TTS audio decoding failure: {}",
                 exc,
