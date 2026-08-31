@@ -80,8 +80,10 @@ async def main():
 
     llm.register_function("end_call", end_call_handler)
 
-    system_prompt = build_system_prompt("inbound", config, None)
+    system_prompt, customer_context = build_system_prompt("inbound", config, None)
     messages = [{"role": "system", "content": system_prompt}]
+    if customer_context:
+        messages.append({"role": "system", "content": customer_context})
 
     llm_provider = active_providers["llm"]
     llm_tools_raw = config.get("providers", {}).get("llm", {}).get(llm_provider, {}).get("params", {}).get("tools", [])

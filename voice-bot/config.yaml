@@ -47,11 +47,10 @@ providers:
         model: whisper-1
   llm:
     sarvam:
-      class_path: pipecat.services.openai.llm.OpenAILLMService
+      class_path: pipecat.services.sarvam.llm.SarvamLLMService
       api_key_env: SARVAM_API_KEY
       params:
         model: sarvam-105b-conversations
-        base_url: https://api.sarvam.ai/v1
         temperature: 0.2
         max_completion_tokens: 160
         tools: &id001

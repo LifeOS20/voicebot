@@ -45,7 +45,14 @@ def build_system_prompt(
     call_type: str,
     config: dict,
     campaign_data: dict | None,
-) -> str:
+) -> tuple[str, str | None]:
+    """
+    Returns (system_prompt, customer_context_message).
+    
+    The system_prompt is now static (no customer_name interpolation) to enable
+    prompt prefix caching. The customer_context_message contains dynamic
+    per-call information and is added as a separate context message.
+    """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     voice_rules = str(config.get("voice_rules", "")).strip()
 
@@ -61,13 +68,6 @@ def build_system_prompt(
         if api_prompt and not _looks_like_orchestration_instruction(api_prompt):
             campaign_prompt = api_prompt
         elif configured_campaign:
-            # OBSERVABILITY ADDITION: previously, if the API sent a real
-            # campaign_prompt that this heuristic rejected, that fact was
-            # invisible -- the call would just silently run on the
-            # config.yaml fallback instead, with nothing in the logs to
-            # explain why. This makes a rejection show up as a warning
-            # instead of a mystery the next time someone asks "why didn't
-            # my campaign script get used?"
             if api_prompt:
                 logger.warning(
                     "Rejected API-provided campaign_prompt as a likely "
@@ -85,10 +85,8 @@ def build_system_prompt(
     else:
         campaign_prompt = str(config.get("base_prompt", "")).strip()
 
-    customer_name = (
-        str(campaign_data.get("customer_name", "there")) if campaign_data else "there"
-    )
-    campaign_prompt = campaign_prompt.replace("{customer_name}", customer_name)
+    # DO NOT interpolate {customer_name} here - keep prompt static for caching
+    # The customer context will be added as a separate message
 
     parts = [p for p in (voice_rules, campaign_prompt) if p]
 
@@ -106,6 +104,16 @@ def build_system_prompt(
         )
 
     parts.append(f"Current time: {now}")
-    result = "\n\n".join(parts)
+    system_prompt = "\n\n".join(parts)
+
+    # Build customer context message for caching-friendly dynamic content
+    customer_context = None
+    if campaign_data and (customer_name := campaign_data.get("customer_name")):
+        customer_context = (
+            f"CALL CONTEXT: You are calling {customer_name}. "
+            f"Use their name naturally in conversation. "
+            f"Do not repeat this context - it is for your reference only."
+        )
+
     logger.info("Using campaign prompt ({} chars)", len(campaign_prompt))
-    return result
+    return system_prompt, customer_context

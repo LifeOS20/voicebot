@@ -19,7 +19,7 @@ requests
 # for. But an unpinned install would silently pull 2.0.0 the day it ships
 # and break the app outright. Plan a PipelineWorker/WorkerRunner migration
 # before ever lifting this ceiling.
-pipecat-ai[daily,deepgram,openai,elevenlabs,silero,sarvam,groq]<2.0.0,>=1.8.0
+pipecat-ai[deepgram,openai,elevenlabs,silero,sarvam,groq]==1.8.1
 redis
 
 # NOTE: torch, torchvision, torchaudio, transformers, and chatterbox-tts

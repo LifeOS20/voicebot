@@ -75,7 +75,7 @@ CONFIG = None
 CALL_MANAGER = CallManager()
 
 # ------------------------------------------------------------------
-# Concurrency cap
+# Concurrency cap using asyncio.Semaphore for proper async safety
 # ------------------------------------------------------------------
 # There was no admission control anywhere in this file: no semaphore, no
 # active-call counter, no limit on simultaneous WebSocket connections. Under
@@ -87,26 +87,19 @@ CALL_MANAGER = CallManager()
 # process and taking every call in progress down at once, not just the one
 # that tipped it over.
 #
-# Safe to do with a plain int (no asyncio.Lock needed): the check-then-
-# increment below has no `await` between the read and the write, so nothing
-# else can run on this single-threaded event loop in between. Size
-# MAX_CONCURRENT_CALLS from an actual load test against your real provider
-# stack -- 50 is a placeholder starting point, not a measured number.
+# Using asyncio.Semaphore ensures proper async acquisition/release without
+# race conditions. Size MAX_CONCURRENT_CALLS from an actual load test against
+# your real provider stack -- 50 is a placeholder starting point, not a
+# measured number.
 MAX_CONCURRENT_CALLS = int(os.getenv("MAX_CONCURRENT_CALLS", "50"))
-_active_calls = 0
+_call_semaphore: asyncio.Semaphore | None = None
 
 
-def _try_acquire_call_slot() -> bool:
-    global _active_calls
-    if _active_calls >= MAX_CONCURRENT_CALLS:
-        return False
-    _active_calls += 1
-    return True
-
-
-def _release_call_slot() -> None:
-    global _active_calls
-    _active_calls = max(0, _active_calls - 1)
+def get_call_semaphore() -> asyncio.Semaphore:
+    global _call_semaphore
+    if _call_semaphore is None:
+        _call_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CALLS)
+    return _call_semaphore
 
 
 @asynccontextmanager
@@ -299,7 +292,7 @@ async def handle_outbound_answer(request: Request):
     # wss (websocket secure) for https, ws for http
     scheme = "wss" if request.url.scheme == "https" else "ws"
     call_id = request.query_params.get("call_id", "")
-    stream_url = f"{scheme}://{host}/ws?type=outbound&amp;call_id={call_id}"
+    stream_url = f"{scheme}://{host}/ws?type=outbound&call_id={call_id}"
 
     vxml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -340,14 +333,13 @@ async def websocket_endpoint(websocket: WebSocket):
     # We read that message -> set stream_id="abc-123" -> Bot starts talking.
     stream_id = None
 
-    if not _try_acquire_call_slot():
+    semaphore = get_call_semaphore()
+    acquired = await asyncio.wait_for(semaphore.acquire(), timeout=1.0)
+    if not acquired:
         logger.warning(
             f"At capacity ({MAX_CONCURRENT_CALLS} concurrent calls) -- "
             f"rejecting new {call_type} connection"
         )
-        # 1013 = RFC 6455 "Try Again Later". The provider's own retry/
-        # failover behavior on a rejected stream is provider-specific --
-        # confirm Vobiz's behavior here before relying on it in production.
         await websocket.close(code=1013, reason="At capacity")
         return
 
@@ -387,7 +379,7 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"[{stream_id}] WebSocket error ({call_type}): {e}")
     finally:
-        _release_call_slot()
+        get_call_semaphore().release()
         logger.info(f"[{stream_id}] WebSocket closed ({call_type})")
 
 # WEB BROWSER WEBSOCKET ENDPOINT (NO TELEPHONY)
@@ -412,7 +404,9 @@ async def websocket_web_endpoint(websocket: WebSocket):
     # call_id is already generated for outbound calls elsewhere in this file.
     stream_id = f"web-{uuid.uuid4()}"
 
-    if not _try_acquire_call_slot():
+    semaphore = get_call_semaphore()
+    acquired = await asyncio.wait_for(semaphore.acquire(), timeout=1.0)
+    if not acquired:
         logger.warning(
             f"At capacity ({MAX_CONCURRENT_CALLS} concurrent calls) -- "
             f"rejecting new web connection"
@@ -441,9 +435,8 @@ async def websocket_web_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"[{stream_id}] Web WebSocket error: {e}")
     finally:
-        _release_call_slot()
+        get_call_semaphore().release()
         logger.info(f"[{stream_id}] Web WebSocket closed")
-
 
 
 # HEALTH CHECK
@@ -451,10 +444,12 @@ async def websocket_web_endpoint(websocket: WebSocket):
 async def health():
     # Health check endpoint reports which services are configured
     active = CONFIG.get("active_providers", {})
+    semaphore = get_call_semaphore()
+    active_calls = MAX_CONCURRENT_CALLS - semaphore._value
     return {
         "status": "healthy",
         "configured_services": active,
-        "active_calls": _active_calls,
+        "active_calls": active_calls,
         "max_concurrent_calls": MAX_CONCURRENT_CALLS,
     }
 

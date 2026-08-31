@@ -13,45 +13,8 @@ from pipecat.frames.frames import (
 
 # How long after sending clearAudio to keep dropping outgoing audio frames
 # instead of forwarding them as playAudio.
-#
-# WHY THIS EXISTS: your InterruptionFrame branch below is correct and was
-# already doing the right thing -- I got this wrong in an earlier answer
-# (I guessed you'd need StartInterruptionFrame; this codebase's turn
-# management goes through broadcast_interruption(), which pushes an actual
-# InterruptionFrame, per pipecat's own docs: "pushed to interrupt the
-# pipeline... to cancel any in-progress bot output"). So if you're still
-# hearing the tail of a cut-off sentence after wiring this up, the
-# remaining explanation is a narrower one:
-#
-# InterruptionFrame is a SystemFrame, and pipecat pushes SystemFrames
-# "directly downstream" -- bypassing the normal per-processor queue -- so
-# it reaches this serializer as fast as physically possible. A regular
-# AudioRawFrame that Sarvam's TTS service had already pulled off its own
-# websocket a few milliseconds earlier can still be sitting in that
-# service's outgoing queue when the interruption overtakes it, and gets
-# pushed through moments later. By the time it reaches serialize() here,
-# there's no way to tell "this is a genuine new reply's first chunk" from
-# "this is a straggler from the utterance we just cancelled" -- both are
-# just AudioRawFrame instances. This is a known category of ordering issue
-# in pipecat, not unique to this integration: see
-# https://github.com/pipecat-ai/pipecat/issues/1323 for the same
-# after-the-interruption-frame reordering failure mode on the input side
-# ("frames arriving after StopInterruptionFrame... causes bot to repeat
-# itself multiple times").
-#
-# This is a mitigation, not a proof, and it's a time heuristic because
-# there is no generation ID to check instead: a genuinely new bot
-# utterance needs a full LLM + TTS round trip, which this call's own
-# metrics show taking 300-500ms+ end to end (see the
-# tts_time_to_first_audio log lines). Audio arriving inside a much shorter
-# window right after a clear is essentially certain to be a straggler.
-# Tune this against your own TTFA numbers if you change providers, and
-# watch for the "Dropped ... stale TTS straggler" warning below in your
-# logs -- if you never see it fire, this isn't actually your bug and the
-# real explanation is somewhere else (worth checking whether the SAME
-# double-voice symptom reproduces on Vobiz calls, not just the web demo --
-# if it doesn't, look for something demo/browser-specific instead).
-_POST_CLEAR_DROP_WINDOW_S = 0.2
+# Increased to 1.0s to match Vobiz serializer and account for network latency + pacing.
+_POST_CLEAR_DROP_WINDOW_S = 1.0
 
 
 class WebPCMFrameSerializer(FrameSerializer):
@@ -62,16 +25,27 @@ class WebPCMFrameSerializer(FrameSerializer):
     async def setup(self, frame: StartFrame):
         pass
 
+    def on_interruption(self) -> None:
+        """Call when barge-in detected - activates drop window."""
+        self._drop_audio_until = time.monotonic() + _POST_CLEAR_DROP_WINDOW_S
+        logger.debug(
+            "[WebPCM] TX -> clearAudio stream_id={} guard_window={}s",
+            self._stream_id,
+            _POST_CLEAR_DROP_WINDOW_S,
+        )
+
+    def next_generation(self) -> int:
+        """Call when a new user turn starts - clears any pending drop window."""
+        self._drop_audio_until = 0.0
+        logger.debug(
+            "[WebPCMSerializer] New generation started, drop window cleared stream_id={}",
+            self._stream_id,
+        )
+        return 1
+
     async def serialize(self, frame: Frame) -> str | bytes | None:
         if isinstance(frame, InterruptionFrame):
-            self._drop_audio_until = time.monotonic() + _POST_CLEAR_DROP_WINDOW_S
-
-            logger.debug(
-                "[WebPCM] TX -> clearAudio stream_id={} guard_window={}s",
-                self._stream_id,
-                _POST_CLEAR_DROP_WINDOW_S,
-            )
-
+            self.on_interruption()
             return json.dumps({"event": "clearAudio", "streamId": self._stream_id})
 
         if isinstance(frame, AudioRawFrame):
@@ -85,8 +59,6 @@ class WebPCMFrameSerializer(FrameSerializer):
                 )
                 return None
 
-            # Debug logging only when needed - avoid expensive struct.unpack
-            logger.debug(f"[WebPCM] TX -> len:{len(frame.audio)}, sr:{frame.sample_rate}")
             payload = base64.b64encode(frame.audio).decode("utf-8")
             return json.dumps(
                 {

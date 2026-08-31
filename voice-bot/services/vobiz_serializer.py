@@ -1,11 +1,16 @@
 """
-When the caller speaks, it converts the phone audio into a format the AI can understand (µ-law to PCM) and sends it into the pipeline.
-When the bot speaks, it converts the AI's audio back into phone-call format (PCM to µ-law) and sends it to the caller.
+Vobiz Frame Serializer with simple, robust interruption handling.
+
+Key features:
+- Post-interruption audio drop window to eliminate stale TTS stragglers
+- Proper µ-law <-> PCM conversion with resampling
+- DTMF support
 """
 
 import base64
 import json
 import audioop
+import time
 from loguru import logger
 from pipecat.audio.utils import ulaw_to_pcm, create_stream_resampler
 from pipecat.serializers.base_serializer import FrameSerializer
@@ -22,57 +27,91 @@ from pipecat.frames.frames import (
 from pipecat.audio.dtmf.types import KeypadEntry
 
 
-class VobizFrameSerializer(FrameSerializer):
-    # Acts as an adapter between Vobiz and Pipecat
-    def __init__(self, stream_id: str, sample_rate: int = 8000):
-        self._stream_id = stream_id  # call identifier
-        self._vobiz_sample_rate = sample_rate  # sample rate of vobiz (8000 for telephony)
+# How long after sending clearAudio to keep dropping outgoing audio frames.
+# This addresses the Pipecat frame ordering issue where AudioRawFrames from a
+# cancelled utterance can still be in-flight when InterruptionFrame arrives.
+# Increased to 1.0s to account for network RTT + pacing + cancellation latency.
+_POST_CLEAR_DROP_WINDOW_S = 1.0
 
-        # Inside the pipeline, the audio may run at a different rate like 16 kHz if the speech services need it
+
+class VobizFrameSerializer(FrameSerializer):
+    def __init__(self, stream_id: str, sample_rate: int = 8000):
+        self._stream_id = stream_id
+        self._vobiz_sample_rate = sample_rate
         self._sample_rate = 0
 
-        # Resamplers handle sample rate conversion so that the audio doesnt sound broken
         self._input_resampler = create_stream_resampler()
         self._output_resampler = create_stream_resampler()
 
+        # Simple interruption handling: drop window after clearAudio
+        self._drop_audio_until = 0.0
+
     async def setup(self, frame: StartFrame):
-        # Runs once and saves the pipelines preferred audio sample rate so we know how to convert audio correctly
         self._sample_rate = frame.audio_in_sample_rate
+        logger.debug(
+            "[VobizSerializer] Setup complete stream_id={} pipeline_sample_rate={} vobiz_sample_rate={}",
+            self._stream_id,
+            self._sample_rate,
+            self._vobiz_sample_rate,
+        )
+
+    def on_interruption(self) -> None:
+        """Call when barge-in detected - activates drop window."""
+        self._drop_audio_until = time.monotonic() + _POST_CLEAR_DROP_WINDOW_S
+        logger.debug(
+            "[VobizSerializer] Interruption: drop window activated for {}s stream_id={}",
+            _POST_CLEAR_DROP_WINDOW_S,
+            self._stream_id,
+        )
+
+    def next_generation(self) -> int:
+        """Call when a new user turn starts - clears any pending drop window."""
+        self._drop_audio_until = 0.0
+        logger.debug(
+            "[VobizSerializer] New generation started, drop window cleared stream_id={}",
+            self._stream_id,
+        )
+        return 1
 
     async def serialize(self, frame: Frame) -> str | bytes | None:
-        # If the user interrupts, it sends a clearAudio message to stop playback immediately.
+        # InterruptionFrame: send clearAudio and activate drop window
         if isinstance(frame, InterruptionFrame):
+            self.on_interruption()
             return json.dumps({"event": "clearAudio", "streamId": self._stream_id})
 
-        # If the bot is speaking, it converts the bots audio into phone-call format and sends it as playAudio
+        # AudioRawFrame: apply drop window
         if isinstance(frame, AudioRawFrame):
+            # Drop if in post-interruption guard window
+            if time.monotonic() < self._drop_audio_until:
+                logger.warning(
+                    "[VobizSerializer] Dropped {} bytes in post-interruption guard window stream_id={}",
+                    len(frame.audio),
+                    self._stream_id,
+                )
+                return None
+
             # Resample to 8000Hz if needed
             if frame.sample_rate != self._vobiz_sample_rate:
                 audio_data = await self._output_resampler.resample(
                     frame.audio,
                     frame.sample_rate,
-                    self._vobiz_sample_rate
+                    self._vobiz_sample_rate,
                 )
             else:
                 audio_data = frame.audio
 
             if not audio_data:
-                logger.warning("Serialized audio data is empty")
+                logger.warning("[VobizSerializer] Serialized audio data is empty")
                 return None
 
             # Convert PCM (16-bit) to Mu-Law (8-bit)
-            # audio_data is 16-bit linear PCM at 8000Hz (ensured by resampler check above)
             try:
                 ulaw_data = audioop.lin2ulaw(audio_data, 2)
             except Exception as e:
-                logger.error(f"Error encoding audio to mu-law: {e}")
+                logger.error("[VobizSerializer] Error encoding audio to mu-law: {}", e)
                 return None
 
             payload = base64.b64encode(ulaw_data).decode("utf-8")
-            
-            # Log periodically to avoid spam, or just log size
-            # logger.debug(f"Sending audio frame: {len(payload)} bytes")
-            
             return json.dumps(
                 {
                     "event": "playAudio",
@@ -85,7 +124,7 @@ class VobizFrameSerializer(FrameSerializer):
                 }
             )
 
-        # If it is a custom event, it simply passes the JSON message (e.g call transfer)
+        # Custom events (e.g., call transfer)
         if isinstance(frame, (OutputTransportMessageFrame, OutputTransportMessageUrgentFrame)):
             return json.dumps(frame.message)
         return None
