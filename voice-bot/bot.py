@@ -23,11 +23,10 @@ from dotenv import load_dotenv
 from fastapi import WebSocket
 from loguru import logger
 
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.frames.frames import (
     AudioRawFrame,
+    EndTaskFrame,
     FunctionCallResultProperties,
     Frame,
     InterruptionFrame,
@@ -49,10 +48,9 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.turns.user_start import (
-    VADUserTurnStartStrategy,
-    TranscriptionUserTurnStartStrategy,
+    ExternalUserTurnStartStrategy,
 )
-from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
+from pipecat.turns.user_stop import ExternalUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -87,8 +85,105 @@ logger.add(
 STREAM_PROVIDER_CALL_IDS: dict[str, str] = {}
 
 
-# Global VAD analyzer - reused across calls for ~1-2s cold-start savings
-VAD_ANALYZER: Optional[SileroVADAnalyzer] = None
+
+class InitialOutboundHandshakeProcessor(FrameProcessor):
+    """Handle the first caller response without spending an LLM turn on greetings."""
+
+    GREETING_WORDS = {
+        "hi", "hello", "hey", "hiya", "namaste", "namaskar",
+        "हाय", "हेलो", "नमस्ते", "నమస్తే", "హలో",
+    }
+    YES_WORDS = {"yes", "yeah", "yep", "yup", "haan", "han", "ji"}
+
+    def __init__(self, *, enabled: bool, customer_name: str | None = None) -> None:
+        super().__init__()
+        self._enabled = enabled
+        self._customer_name = (customer_name or "").strip()
+        self._handled_first_transcript = False
+
+    @staticmethod
+    def _normalize(text: str) -> list[str]:
+        text = " ".join((text or "").strip().lower().split())
+        return text.split()
+
+    def _classify(self, text: str) -> str | None:
+        tokens = self._normalize(text)
+        if not tokens:
+            return None
+
+        # Greeting-only responses are the common barge-in case after the
+        # application's outbound opening. Do not spend an LLM turn on them.
+        if len(tokens) <= 3 and all(token in self.GREETING_WORDS for token in tokens):
+            return "greeting"
+
+        # Identity confirmations can also be answered deterministically.
+        if len(tokens) <= 4:
+            greeting_present = any(token in self.GREETING_WORDS for token in tokens)
+            yes_present = any(token in self.YES_WORDS for token in tokens)
+            if greeting_present and yes_present:
+                return "identity"
+            if tokens[0] in self.YES_WORDS:
+                return "identity"
+
+        if self._customer_name:
+            name_tokens = set(self._normalize(self._customer_name))
+            if name_tokens and name_tokens.issubset(set(tokens)) and len(tokens) <= len(name_tokens) + 2:
+                return "identity"
+
+        return None
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+
+        if (
+            not self._enabled
+            or self._handled_first_transcript
+            or direction != FrameDirection.DOWNSTREAM
+            or not isinstance(frame, TranscriptionFrame)
+        ):
+            await self.push_frame(frame, direction)
+            return
+
+        text = getattr(frame, "text", "") or ""
+        if not text.strip():
+            await self.push_frame(frame, direction)
+            return
+
+        # Only consume a finalized first transcript. Interim text must continue
+        # downstream so normal turn handling remains untouched.
+        finalized = getattr(frame, "finalized", True)
+        if finalized is False:
+            await self.push_frame(frame, direction)
+            return
+
+        response_type = self._classify(text)
+        self._handled_first_transcript = True
+
+        if response_type == "greeting":
+            response = (
+                "Hi, yes. This is Ananya from Prestige Group, "
+                "calling about Prestige Green Meadows in Whitefield."
+            )
+        elif response_type == "identity":
+            name = f", {self._customer_name}" if self._customer_name else ""
+            response = (
+                f"Thanks{name}. I’m Ananya from Prestige Group, "
+                "calling about Prestige Green Meadows in Whitefield. Do you have a minute?"
+            )
+        else:
+            # Substantive first turns must go through the normal LLM path.
+            await self.push_frame(frame, direction)
+            return
+
+        logger.debug(
+            "Initial outbound handshake handled locally: transcript={!r} response_type={}",
+            text,
+            response_type,
+        )
+        await self.push_frame(
+            TTSSpeakFrame(text=response, append_to_context=False),
+            FrameDirection.DOWNSTREAM,
+        )
 
 
 class LanguageObserver(FrameProcessor):
@@ -247,6 +342,10 @@ class ServiceFactory:
         params = dict(provider_config.get("params", {}))
         params.pop("tools", None)
 
+        # Sarvam legacy STT provides its own server-side VAD when enabled.
+        if service_type == "stt" and provider_name == "sarvam":
+            params["vad_signals"] = True
+
         if service_type == "stt":
             stt_lang = params.get("language")
             if not stt_lang or stt_lang == "unknown":
@@ -308,11 +407,6 @@ async def warmup_providers(config: dict, aiohttp_session: aiohttp.ClientSession 
             await asyncio.to_thread(ServiceFactory._import_class, class_path)
         except Exception:
             logger.exception("Warmup: failed to import {}", class_path)
-
-    try:
-        await asyncio.to_thread(SileroVADAnalyzer)
-    except Exception:
-        logger.exception("Warmup: failed to prime Silero VAD")
 
     # Pre-warm aiohttp session connections if provided
     if aiohttp_session and not aiohttp_session.closed:
@@ -446,7 +540,7 @@ class _SilenceChecker(FrameProcessor):
         stream_id: str,
         task: PipelineTask | None = None,
         context_aggregator_user: Any,
-        silence_threshold_secs: float = 8.0,
+        silence_threshold_secs: float = 5.0,
         check_in_message: str = "Are you still there? I'm listening.",
     ) -> None:
         super().__init__()
@@ -530,16 +624,8 @@ class _SilenceChecker(FrameProcessor):
 
 
 class _TerminationProcessor(FrameProcessor):
-    """
-    Termination detection and text buffering processor.
-    
-    Based on the old bot's working TerminationProcessor but fixed:
-    - Buffers LLM text output and releases at sentence boundaries
-    - Detects termination phrases (goodbye, [HANGUP], end_call leaks)
-    - Handles end_call tool invocation gracefully
-    - Does NOT hold text indefinitely - flushes on LLMFullResponseEndFrame
-    """
-    
+    """Detect farewell text without buffering or rewriting normal LLM output."""
+
     def __init__(
         self,
         *,
@@ -555,14 +641,13 @@ class _TerminationProcessor(FrameProcessor):
         self._force_hangup_fn = force_hangup_fn
         self._grace_seconds = grace_seconds
         self._safety_seconds = safety_seconds
-
         self._termination_requested = False
         self._provider_hangup_sent = False
         self._waiting_for_bot_stop = False
         self._hangup_task: asyncio.Task | None = None
-        self._buffer = ""  # Buffer for accumulating text frames
+        self._shutdown_state: dict[str, bool] = {}
+        self._end_call_pending: dict[str, bool] = {}
 
-        # Silent Triggers: Matches STRIPPED and trigger immediate hangup
         self.silent_termination_patterns = [
             ("end_call_leak", re.compile(r"\bend[_\s-]?call\b\.?", re.IGNORECASE)),
             ("tool_narration", re.compile(r"\b(call|dial|invok|trigger|activat)\w*\s+(the\s+)?(tool|function|api)\b", re.IGNORECASE)),
@@ -571,150 +656,97 @@ class _TerminationProcessor(FrameProcessor):
             ("explicit_tag", re.compile(r"\[hangup\]|\[end\]", re.IGNORECASE)),
         ]
 
-        # Spoken Triggers: Matches SPOKEN then trigger hangup after speech
         self.spoken_termination_patterns = [
             re.compile(r"\b(goodbye|bye|good day|take care)\b", re.IGNORECASE),
             re.compile(r"\bhave a (nice|great|good) (day|evening|night)\b", re.IGNORECASE),
             re.compile(r"\btalk to you (later|soon)\b", re.IGNORECASE),
+            re.compile(r"\bthank you for your time\b", re.IGNORECASE),
+            re.compile(r"\bthanks for your time\b", re.IGNORECASE),
         ]
 
+    def bind_state(
+        self,
+        *,
+        shutdown_state: dict[str, bool],
+        end_call_pending: dict[str, bool],
+    ) -> None:
+        self._shutdown_state = shutdown_state
+        self._end_call_pending = end_call_pending
+
     async def _hangup_after_bot_stop(self) -> None:
-        await asyncio.sleep(self._grace_seconds)
-        if not self._provider_hangup_sent:
-            await self._force_hangup_fn("termination_after_bot_stop")
-            self._provider_hangup_sent = True
-        await self.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+        try:
+            await asyncio.sleep(self._grace_seconds)
+            if not self._provider_hangup_sent:
+                await self._force_hangup_fn("farewell_complete")
+                self._provider_hangup_sent = True
+            await self.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+        except asyncio.CancelledError:
+            return
 
     async def _schedule_hangup(self, delay: float) -> None:
-        await asyncio.sleep(delay)
-        if not self._provider_hangup_sent:
-            await self._force_hangup_fn("termination_immediate")
-            self._provider_hangup_sent = True
-        await self.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
-
-    def _flush_buffer(self, direction: FrameDirection) -> None:
-        """Flush any remaining buffer as a TextFrame."""
-        if self._buffer.strip() and not hasattr(self, '_shutdown_state') or not getattr(self, '_shutdown_state', {}).get('active', False):
-            text_to_emit = self._buffer.strip()
-            self._buffer = ""
-            if text_to_emit:
-                logger.debug(f"[{self._stream_id}] Flushing buffer: {text_to_emit[:100]}")
-                asyncio.create_task(self.push_frame(TextFrame(text=text_to_emit), direction))
+        try:
+            await asyncio.sleep(delay)
+            if not self._provider_hangup_sent:
+                await self._force_hangup_fn("termination_immediate")
+                self._provider_hangup_sent = True
+            await self.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+        except asyncio.CancelledError:
+            return
 
     async def process_frame(
         self,
         frame: Frame,
         direction: FrameDirection,
     ) -> None:
-        # Gate: Block downstream speech if shutdown is active
-        if direction == FrameDirection.DOWNSTREAM:
-            shutdown_active = getattr(self, '_shutdown_state', {}).get('active', False)
-            if shutdown_active and isinstance(frame, (TextFrame, TTSSpeakFrame)):
-                return
-
-        await super().process_frame(frame, direction)
-
-        # Handle Interruption: If user speaks during bot's farewell, cancel hangup
-        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, UserStartedSpeakingFrame):
-            if self._waiting_for_bot_stop:
-                logger.info(f"[{self._stream_id}] User interrupted mid-goodbye. Cancelling hangup.")
-                self._waiting_for_bot_stop = False
-                self._termination_requested = False
-                self._provider_hangup_sent = False
-                if hasattr(self, '_shutdown_state'):
-                    self._shutdown_state["active"] = False
-                if hasattr(self, '_end_call_pending'):
-                    self._end_call_pending["active"] = False
-            elif self._hangup_task:
-                logger.info(f"[{self._stream_id}] User spoke after goodbye. Hangup committed.")
+        # A barge-in cancels a pending farewell hangup.
+        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, InterruptionFrame):
+            self._waiting_for_bot_stop = False
+            if self._hangup_task and not self._hangup_task.done():
+                self._hangup_task.cancel()
+            self._hangup_task = None
+            self._termination_requested = False
+            self._provider_hangup_sent = False
+            self._shutdown_state["active"] = False
+            self._end_call_pending["active"] = False
+            await super().process_frame(frame, direction)
             await self.push_frame(frame, direction)
             return
 
-        # Bot finished speaking - trigger hangup if waiting
+        # Inspect speech for farewell intent, but pass the original frame through unchanged.
+        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, (TextFrame, TTSSpeakFrame)):
+            text = getattr(frame, "text", "") or ""
+            silent_match = any(pattern.search(text) for _, pattern in self.silent_termination_patterns)
+            spoken_match = any(pattern.search(text) for pattern in self.spoken_termination_patterns)
+
+            if silent_match:
+                self._termination_requested = True
+                self._shutdown_state["active"] = True
+                if self._hangup_task and not self._hangup_task.done():
+                    self._hangup_task.cancel()
+                self._hangup_task = asyncio.create_task(self._schedule_hangup(0.5))
+                logger.info("[{}] Silent termination detected; forcing hangup", self._stream_id)
+            elif spoken_match:
+                self._termination_requested = True
+                self._waiting_for_bot_stop = True
+                self._shutdown_state["active"] = True
+                logger.info("[{}] Farewell detected; will hang up after bot stops speaking", self._stream_id)
+
+            await super().process_frame(frame, direction)
+            await self.push_frame(frame, direction)
+            return
+
+        # Once the farewell has actually finished playing, hang up.
         if direction == FrameDirection.UPSTREAM and isinstance(frame, BotStoppedSpeakingFrame):
             if self._waiting_for_bot_stop and not self._hangup_task:
-                logger.info(f"[{self._stream_id}] Bot finished speaking. Hanging up in {self._grace_seconds}s.")
+                logger.info("[{}] Farewell finished; hanging up in {}s", self._stream_id, self._grace_seconds)
                 self._hangup_task = asyncio.create_task(self._hangup_after_bot_stop())
                 self._waiting_for_bot_stop = False
-            elif getattr(self, '_end_call_pending', {}).get("active", False) and not self._hangup_task:
-                logger.info(f"[{self._stream_id}] Bot finished speaking after end_call. Hanging up in {self._grace_seconds}s.")
-                if hasattr(self, '_shutdown_state'):
-                    self._shutdown_state["active"] = True
-                if hasattr(self, '_end_call_pending'):
-                    self._end_call_pending["active"] = False
-                self._hangup_task = asyncio.create_task(self._hangup_after_bot_stop())
+
+            await super().process_frame(frame, direction)
             await self.push_frame(frame, direction)
             return
 
-        # End of LLM Response -> Flush remaining buffer
-        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, LLMFullResponseEndFrame):
-            if self._buffer.strip():
-                self._flush_buffer(direction)
-            self._buffer = ""
-            await self.push_frame(frame, direction)
-            return
-
-        # Process text frames: buffer, detect termination, release at sentence boundaries
-        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, (TextFrame, TTSSpeakFrame)):
-            # 1. Accumulate text
-            self._buffer += frame.text
-            
-            # 2. Analyze buffer for termination triggers
-            hangup_requested = False
-            cleaned_text = self._buffer
-
-            # Check Silent Patterns (strip them from output)
-            for name, pattern in self.silent_termination_patterns:
-                if pattern.search(cleaned_text):
-                    hangup_requested = True
-                    logger.info(f"[{self._stream_id}] Silent termination triggered: '{name}'")
-                    cleaned_text = pattern.sub("", cleaned_text)
-            
-            # Check Spoken Patterns (only if not already triggered)
-            if not hangup_requested:
-                for pattern in self.spoken_termination_patterns:
-                    if pattern.search(cleaned_text):
-                        hangup_requested = True
-                        break
-
-            if hangup_requested:
-                cleaned_text = re.sub(r"^[.,!?\s]+|[.,!?\s]+$", "", cleaned_text)
-                logger.info(f"[{self._stream_id}] Termination triggered. Cleaned: '{cleaned_text}'")
-                
-                self._termination_requested = True
-                if hasattr(self, '_shutdown_state'):
-                    self._shutdown_state["active"] = True
-                
-                # Emit any remaining spoken text (e.g., "Goodbye")
-                if cleaned_text.strip():
-                    self._waiting_for_bot_stop = True
-                    if isinstance(frame, TextFrame):
-                        await self.push_frame(TextFrame(text=cleaned_text), direction)
-                    elif isinstance(frame, TTSSpeakFrame):
-                        await self.push_frame(TTSSpeakFrame(text=cleaned_text), direction)
-                else:
-                    # Silent trigger - hang up immediately
-                    self._waiting_for_bot_stop = False
-                    asyncio.create_task(self._schedule_hangup(delay=0.5))
-                
-                self._buffer = ""
-                return
-
-            # 3. If safe, check for sentence boundaries to release text
-            if re.search(r"[.!?]\s*$", self._buffer):
-                text_to_emit = self._buffer.strip()
-                self._buffer = ""
-                if text_to_emit:
-                    if isinstance(frame, TextFrame):
-                        await self.push_frame(TextFrame(text=text_to_emit), direction)
-                    elif isinstance(frame, TTSSpeakFrame):
-                        await self.push_frame(TTSSpeakFrame(text=text_to_emit), direction)
-                return
-
-            # 4. No sentence boundary yet - HOLD the frame (don't push yet)
-            return
-
-        # Pass through all other frames
+        await super().process_frame(frame, direction)
         await self.push_frame(frame, direction)
 
 
@@ -1057,29 +1089,13 @@ async def run_bot(
             else VobizFrameSerializer(stream_id=stream_id, sample_rate=8000)
         )
 
-        # Initialize global VAD analyzer if not already done
-        global VAD_ANALYZER
-        if VAD_ANALYZER is None and config.get("vad", {}).get("enabled", True):
-            vad_config = config.get("vad", {})
-            logger.info("Initializing Global Silero VAD...")
-            VAD_ANALYZER = SileroVADAnalyzer(
-                params=VADParams(
-                    start_secs=vad_config.get("min_speech_duration", 0.25),
-                    stop_secs=vad_config.get("silence_timeout", 0.6),  # Lower stop threshold = faster endpointing
-                    confidence=vad_config.get("start_threshold", 0.5),  # Lower threshold = more sensitive
-                )
-            )
-
-        vad_analyzer = VAD_ANALYZER
-
         transport = FastAPIWebsocketTransport(
             websocket=websocket,
             params=FastAPIWebsocketParams(
                 audio_in_enabled=True,
                 audio_out_enabled=True,
                 add_wav_header=False,
-                vad_enabled=True,
-                vad_analyzer=vad_analyzer,
+                vad_enabled=False,
                 vad_audio_passthrough=(active.get("stt") == "deepgram"),
                 serializer=serializer,
             ),
@@ -1121,8 +1137,20 @@ async def run_bot(
             safety_seconds=15.0,
         )
         # Inject references for coordination with end_call handler
-        termination_processor._shutdown_state = shutdown_state
-        termination_processor._end_call_pending = end_call_pending
+        termination_processor.bind_state(
+            shutdown_state=shutdown_state,
+            end_call_pending=end_call_pending,
+        )
+
+        # FIX: call_end_coordinator was referenced inside end_call() but never
+        # instantiated, which caused "name 'call_end_coordinator' is not defined"
+        # on every attempted hangup.
+        call_end_coordinator = _CallEndCoordinator(
+            stream_id=stream_id,
+            on_hangup=_perform_end_of_call_hangup,
+            grace_seconds=1.5,
+            safety_seconds=15.0,
+        )
 
         interruption_audio_gate = _InterruptionAudioGate(
             stream_id=stream_id,
@@ -1174,7 +1202,7 @@ async def run_bot(
                             "actually discussed on this call, thank the caller, and do not call any tool this turn."
                         ),
                     },
-                    properties=FunctionCallResultProperties(run_llm=True),
+                    properties=FunctionCallResultProperties(run_llm=False),
                 )
             except Exception:
                 call_end_coordinator.cancel_ending("end_call setup raised an exception")
@@ -1235,20 +1263,17 @@ async def run_bot(
             user_params=LLMUserAggregatorParams(
                 user_turn_strategies=UserTurnStrategies(
                     start=[
-                        VADUserTurnStartStrategy(),
-                        TranscriptionUserTurnStartStrategy(use_interim=False),
+                        ExternalUserTurnStartStrategy(),
                     ],
                     stop=[
-                        SpeechTimeoutUserTurnStopStrategy(
-                            user_speech_timeout=float(
-                                turn_config.get("user_speech_timeout", 0.5)  # Faster endpointing
-                            ),
+                        ExternalUserTurnStopStrategy(
+                            timeout=0.2,
                             wait_for_transcript=True,
                         ),
                     ],
                 ),
                 user_turn_stop_timeout=float(
-                    turn_config.get("user_turn_stop_timeout", 1.5)  # Faster stop
+                    turn_config.get("user_turn_stop_timeout", 1.0)
                 ),
             ),
         )
@@ -1268,24 +1293,37 @@ async def run_bot(
 
         spoken_text_guard = _SpokenTextGuard()
 
+        customer_name_for_handshake = None
+        if campaign_data:
+            customer_name_for_handshake = campaign_data.get("customer_name")
+        if not customer_name_for_handshake and call_type == "web":
+            customer_name_for_handshake = config.get("test_customer_name")
+
+        initial_outbound_handshake = InitialOutboundHandshakeProcessor(
+            enabled=(conversation_call_type == "outbound"),
+            customer_name=customer_name_for_handshake,
+        )
+
         # Pipeline components - include silence_checker (will set task later)
         silence_checker = _SilenceChecker(
             stream_id=stream_id,
             task=None,  # Will set after task creation
             context_aggregator_user=context_aggregator.user(),
-            silence_threshold_secs=8.0,
-            check_in_message="Are you still there? I'm listening.",
+            silence_threshold_secs=5.0,
+            check_in_message="Are you still there?",
         )
 
         pipeline = Pipeline([
             transport.input(),
             stt,
             language_observer,
+            initial_outbound_handshake,
             context_aggregator.user(),
             llm,
             spoken_text_guard,
             tts,
             interruption_audio_gate,
+            call_end_coordinator,
             termination_processor,
             silence_checker,
             transport.output(),
@@ -1351,21 +1389,20 @@ async def run_bot(
 
             # OLD WORKING APPROACH: Add greeting as user message, trigger LLM to respond
             # This lets the LLM generate the greeting naturally with proper context
+            # Personalized greeting is already built above
+            greeting = (
+                f"Hi, am I speaking with {customer_name}?"
+            )
             messages.append({"role": "assistant", "content": greeting})
 
-            # Advance generation counter for greeting
             interruption_audio_gate.next_generation()
             if hasattr(serializer, "next_generation"):
                 serializer.next_generation()
 
-            # Start silence checker
-            silence_checker.start()
-
             _greeting_sent["done"] = True
 
-            # Queue the context frame to trigger LLM generation
             await task.queue_frames([
-                context_aggregator.user().get_context_frame(),
+                TTSSpeakFrame(text=greeting, append_to_context=False),
             ])
 
             async def hard_timeout():
@@ -1381,7 +1418,7 @@ async def run_bot(
 
         # Bump generation counter every time a user turn concludes
         @context_aggregator.user().event_handler("on_user_turn_stopped")
-        async def on_user_turn_stopped(processor, strategy):
+        async def on_user_turn_stopped(processor, strategy, *args, **kwargs):
             gen_id = interruption_audio_gate.next_generation()
             if hasattr(serializer, "next_generation"):
                 serializer.next_generation()

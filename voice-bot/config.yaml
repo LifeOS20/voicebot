@@ -1,31 +1,28 @@
 active_providers:
-  # FIX (issue 3 / Telugu detection): Deepgram Nova-3's multilingual
-  # code-switching mode ("language: multi", the previous setting) only
-  # covers English, Spanish, French, German, Hindi, Russian, Portuguese,
-  # Japanese, Italian, and Dutch. Telugu and Tamil are NOT in that set --
-  # which is exactly why callers speaking Telugu were coming back as
-  # mangled Spanish-ish text ("bueno", "muro", "cosmctunano"). Sarvam's
-  # saaras:v3 (provider block below, already configured, just unused)
-  # covers 22 Indian languages + English including Telugu and Tamil
-  # natively, with a codemix mode built for exactly this kind of call.
-  # Deepgram is left configured below in case you want it back for an
-  # English-only campaign.
   stt: sarvam
   llm: groq
   tts: sarvam
+
 providers:
   stt:
     sarvam:
-      class_path: pipecat.services.sarvam.stt.SarvamSTTService
-      api_key_env: SARVAM_API_KEY
+      class_path: "pipecat.services.sarvam.stt.SarvamSTTService"
+      api_key_env: "SARVAM_API_KEY"
       params:
-        model: saaras:v3
-        language: unknown
-        mode: codemix
+        model: "saaras:v3"
+        language: "unknown"
+        mode: "codemix"
         sample_rate: 8000
-        input_audio_codec: wav
-        keepalive_timeout: 10
-        keepalive_interval: 5
+        input_audio_codec: "wav"
+        keepalive_timeout: 30
+        keepalive_interval: 15
+        vad_signals: true
+        positive_speech_threshold: 0.70
+        negative_speech_threshold: 0.45
+        min_speech_frames: 2
+        first_turn_min_speech_frames: 8
+        interrupt_min_speech_frames: 2
+        pre_speech_pad_frames: 9
     deepgram:
       class_path: pipecat.services.deepgram.stt.DeepgramSTTService
       api_key_env: DEEPGRAM_API_KEY
@@ -71,14 +68,6 @@ providers:
       params:
         model: qwen/qwen3.8-27b
         temperature: 0.7
-        # LATENCY: was 256. voice_rules already constrains responses to
-        # "usually one or two sentences" -- this call's own metrics never
-        # used more than ~40 completion tokens per turn (see
-        # llm_token_usage log lines), so 256 was pure unused worst-case
-        # tail latency, not headroom anything was using. 120 still leaves
-        # plenty of room for a genuinely longer answer (e.g. reciting the
-        # amenities list) while capping how long a runaway generation can
-        # make the caller wait.
         max_completion_tokens: 120
         tools:
         - type: function
@@ -362,17 +351,20 @@ campaign_prompt: |
   If the caller asks for information you do not have, say so rather than guessing.
   If the caller is unclear, ask them to repeat rather than assuming what they meant.
 
-greeting_inbound: Hi, how can I help you?
-greeting_outbound: Hi, am I speaking with {customer_name}?
+greeting_inbound: "The caller just connected. Greet them briefly and ask how you can help."
+greeting_outbound: "You just called this person. Start with the opening from the campaign script."
 max_conversation_messages: 16
 audio:
   sample_rate: 8000
   enable_interruptions: true
 vad:
   enabled: true
-  start_threshold: 0.6
-  min_speech_duration: 0.25
-  silence_timeout: 0.6
+  start_threshold: 0.55
+  # Keep VAD detection responsive. The turn-stop policy below owns the
+  # conversational pause budget.
+  min_speech_duration: 0.20
+  silence_timeout: 0.20
+
 metrics:
   enable_metrics: true
   enable_usage_metrics: true
@@ -382,7 +374,6 @@ language:
   - en
   - hi
   - te
-  - ta
   default: en
   first_turn_confidence: 0.75
   # FIX: this was 1 -- meaning a single noisy/misheard turn was enough to
@@ -417,6 +408,8 @@ spoken_patterns:
   - \btalk to you (later|soon|phir milenge)\b[\s.?!]*$
 
 turn_management:
-  user_speech_timeout: 0.5
-  user_turn_stop_timeout: 2.0
+  # Fast but still leaves a small window for natural pauses.
+  user_speech_timeout: 0.35
+  # Safety watchdog only. Normal turns should not wait for this.
+  user_turn_stop_timeout: 3.0
 test_customer_name: Simran
