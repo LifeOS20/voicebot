@@ -1,6 +1,8 @@
 import asyncio
 import re
 import uuid
+import aiohttp
+from bot import run_bot, warmup_providers
 from fastapi import FastAPI, WebSocket, HTTPException, Request, Header
 from fastapi.responses import Response
 from pydantic import BaseModel, field_validator

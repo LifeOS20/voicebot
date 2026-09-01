@@ -20,9 +20,18 @@ providers:
         positive_speech_threshold: 0.70
         negative_speech_threshold: 0.45
         min_speech_frames: 2
-        first_turn_min_speech_frames: 8
+        # CHANGED 8 -> 5: this gates how many consecutive speech frames
+        # are required before the system even registers the caller has
+        # started talking, but ONLY on turn 1. Outbound-dialer connections
+        # are clean audio and don't need 8 frames of confirmation -- that
+        # was pure added latency sitting in front of every single call's
+        # first response, unrelated to the greeting-bypass or cache-warm
+        # fixes (which only affect turn-1 LLM TTFB, not STT confirmation
+        # time).
+        first_turn_min_speech_frames: 5
         interrupt_min_speech_frames: 2
         pre_speech_pad_frames: 9
+
     deepgram:
       class_path: pipecat.services.deepgram.stt.DeepgramSTTService
       api_key_env: DEEPGRAM_API_KEY
@@ -37,11 +46,13 @@ providers:
         encoding: linear16
         channels: 1
         endpointing: 100
+
     openai:
       class_path: pipecat.services.openai.stt.OpenAISTTService
       api_key_env: OPENAI_API_KEY
       params:
         model: whisper-1
+
   llm:
     sarvam:
       class_path: pipecat.services.sarvam.llm.SarvamLLMService
@@ -51,34 +62,59 @@ providers:
         temperature: 0.2
         max_completion_tokens: 160
         tools: &id001
-        - type: function
-          function:
-            name: end_call
-            description: 'End the call when the conversation is complete, the caller is not interested, or the caller clearly
-              wants to end the call.
+          - type: function
+            function:
+              name: end_call
+              description: 'End the call when the conversation is complete, the caller is not interested, or the caller clearly
+                wants to end the call.'
+              parameters:
+                type: object
+                properties: {}
+                additionalProperties: false
 
-              '
-            parameters:
-              type: object
-              properties: {}
-              additionalProperties: false
     groq:
       class_path: pipecat.services.groq.llm.GroqLLMService
       api_key_env: GROQ_API_KEY
       params:
         model: qwen/qwen3.8-27b
+
+        # IMPORTANT:
+        # Qwen 3.8 supports explicit non-thinking mode.
+        # This avoids spending reasoning tokens on ordinary voice dialogue.
+        reasoning_effort: none
+
+        # REVERTED to 0.7 (was raised to 0.4 in an earlier pass on the
+        # theory that lower temperature = more reliable instruction
+        # following). Real-world evidence contradicts that: at 0.4 this
+        # small non-thinking model became MORE consistent at whatever
+        # tool-calling bias it already had -- including a false positive
+        # where a buyer saying "I'm looking for 2 BHK options" (a clear
+        # expression of interest) triggered end_call with zero spoken
+        # text. 0.7 matches the configuration that tested reliably before.
+        # If tool-call reliability issues resurface, the fix is a more
+        # explicit/exhaustive prompt (see termination_rules below), not a
+        # lower temperature -- that lever pushes the wrong direction here.
         temperature: 0.7
-        max_completion_tokens: 120
+        top_p: 0.80
+
+        # Raised from 80 -> 200: 80 was hard-truncating mid-sentence
+        # (see "about 10 minutes from White" cutoff in logs), forcing the
+        # bot to fabricate a "connection hiccup" excuse. This is a safety
+        # ceiling, not a target -- the voice_rules brevity instruction is
+        # what actually keeps replies short.
+        max_completion_tokens: 200
+
         tools:
-        - type: function
-          function:
-            name: end_call
-            description: End the call when the caller clearly wants to end the conversation, explicitly declines, or says
-              goodbye.
-            parameters:
-              type: object
-              properties: {}
-              additionalProperties: false
+          - type: function
+            function:
+              name: end_call
+              description: End the call when the caller clearly wants to end the conversation, explicitly declines, or says
+                goodbye.
+              parameters:
+                type: object
+                properties: {}
+                additionalProperties: false
+
     cerebras:
       class_path: pipecat.services.openai.llm.OpenAILLMService
       api_key_env: CEREBRAS_API_KEY
@@ -89,6 +125,7 @@ providers:
         max_completion_tokens: 160
         reasoning_format: hidden
         tools: *id001
+
   tts:
     murf:
       class_path: services.murf_http.MurfFalcon2TTSService
@@ -103,6 +140,7 @@ providers:
         channel_type: MONO
         format: PCM
         request_timeout_seconds: 30
+
     sarvam:
       class_path: pipecat.services.sarvam.tts.SarvamTTSService
       api_key_env: SARVAM_API_KEY
@@ -111,305 +149,189 @@ providers:
         voice_id: pooja
         language: en-IN
         sample_rate: 8000
+
     elevenlabs:
       class_path: services.elevenlabs_http.HttpElevenLabsTTSService
       api_key_env: ELEVENLABS_API_KEY
       params:
         voice_id: REPLACE_WITH_TESTED_MULTILINGUAL_VOICE
+
     deepgram:
       class_path: pipecat.services.deepgram.tts.DeepgramTTSService
       api_key_env: DEEPGRAM_API_KEY
       params:
         voice: aura-asteria-en
+
+
+# Compressed from the original voice_rules. Same behavioral rules, far
+# fewer tokens and no repeated instructions -- this both cuts prompt
+# tokens on every single turn and makes the model more likely to actually
+# follow each rule (a rule buried in a wall of repeated text gets ignored
+# more often than one stated once, clearly).
 voice_rules: |
-  You are Ananya, a real estate sales advisor from Prestige Group speaking to a prospective buyer on a live phone call.
+  You are Ananya, a real estate sales advisor from Prestige Group, on a live call with a prospective buyer.
 
-  Your job is to have a genuine conversation, understand what the buyer is looking for, answer their questions accurately, and help them decide whether the property is worth exploring further.
+  Have a real, buyer-led conversation. Sound like an experienced human agent — warm, calm, confident. Never sound scripted, like a questionnaire, or an IVR.
 
-  Sound like an experienced human sales agent.
-  Be warm, calm, attentive, confident, and conversational.
-  Never sound like a call-centre script, questionnaire, or IVR.
+  Answer whatever the buyer just said, directly, first. Keep replies to 1-3 short sentences and one idea at a time — let the buyer ask for more instead of you front-loading everything. Don't ask a question after every answer; a short answer alone is often enough. Never rush or force a site visit.
 
-  Listen carefully to what the buyer says and respond to that specific point.
-  Do not mechanically move through a list of questions.
-  Do not ask a question after every answer.
-  Do not force the conversation toward a site visit.
-  Let the buyer's interests and responses determine where the conversation goes.
+  Pick up naturally on configuration, budget, location preference, self-use vs. investment, timeline, and priorities — only when it's relevant to what they just said. Don't run through it as a checklist.
 
-  When the buyer asks a question, answer it directly first.
-  After answering, continue naturally only when there is a useful next step.
-  A short acknowledgement is often enough.
-  Sometimes the right response is simply an answer, without another question.
+  Once the caller confirms who they are, do not restate or re-confirm their name (never "Great, it's Simran" or similar) — move straight into the reason for the call. never introduce yourself again, repeat their name, repeat the project name, repeat the reason for the call, or restart the opening. Continue directly from the caller's latest words.
 
-  Learn useful buyer context naturally during the conversation, such as:
-  - what they are looking for
-  - preferred BHK or configuration
-  - budget or price range
-  - location preference
-  - whether the property is for self-use or investment
-  - purchase timeline
-  - what matters most to them
+  Use brief acknowledgements sparingly ("okay", "got it", "sure", "I see"). Don't repeat the project name, your identity, or the call's purpose unless it's newly relevant. Only ask "Are you still there?" if the caller has actually gone silent or the line seems to have dropped.
 
-  Do not ask all of these questions.
-  Only ask for information when it is relevant to what the buyer just said.
+  Talk the way a real person does on the phone: contractions, natural rhythm, an occasional soft filler ("hmm", "right", "yeah, okay") — never a clean, complete-sentence recitation. Vary sentence length; don't polish every line the same way.
 
-  Example:
-  If the buyer asks about price, answer the price question.
-  If they then mention their budget, respond to the budget.
-  If they ask about location, talk about the location.
-  If they say they are just exploring, do not immediately push for a visit.
+  Never invent pricing, availability, discounts, inventory, booking status, possession dates, amenities, distances, or any other detail — use only the property facts you're given.
 
-  Follow the buyer's train of thought.
-  If they change topics, follow them.
-  If they are unsure, help them clarify what matters to them.
-  If they are interested, explore the fit naturally.
-  If they are hesitant, stay low-pressure.
-  If they are not interested, do not try to force the conversation.
+  Everything you say is spoken aloud — output only what the buyer should hear. No labels, reasoning, or tool names.
 
-  Use natural conversational acknowledgements occasionally:
-  "Okay", "right", "got it", "sure", "I see".
-  Use them sparingly.
+  LANGUAGE: mirror the buyer's language and switch fully if asked — no announcing it; mixing is fine if they mix.
 
-  Do not repeat information the buyer already knows.
-  Do not repeatedly restate the project name, your identity, or the reason for the call.
 
-  Never invent pricing, availability, discounts, inventory, booking status, possession changes, amenities, distances, or other facts.
-  Use only the information provided in the campaign.
-
-  Everything you say is spoken aloud.
-  Output only the words the buyer should hear.
-  Do not output reasoning, instructions, labels, tool names, or internal notes.
-
-  LANGUAGE:
-  Speak naturally in the language the buyer is using.
-  If the buyer explicitly asks you to speak another language, switch immediately.
-  If the buyer naturally mixes languages, you may mix languages naturally.
-  Do not announce language switching.
-
-  OUTBOUND:
-  The application has already spoken the opening.
-  Do not repeat the opening.
-  Never say "How can I help you?" on an outbound call.
-  Continue naturally from the buyer's response.
-
-  ENDING:
-  Do not end the call because the buyer pauses, says "um", says "okay", asks a question, discusses price, mentions a budget, is undecided, or wants more information.
-
-  Only end the call when the buyer clearly wants to end the conversation, clearly declines, says goodbye, or the conversation has naturally reached its end.
-
-  When the buyer clearly wants to end:
-  give a brief, natural goodbye and then use the end_call tool.
-
+# REVERTED from an "example-driven" rewrite that regressed hard: it
+# trimmed your original exhaustive negative list down to a handful of
+# example phrases (yes/sure/haan haan batao/bolo), and the model then
+# treated a buyer clearly stating interest -- "I'm looking for 2 BHK
+# options" -- as a signal to end the call, since that phrasing didn't
+# match any example it had been given. A small, non-thinking model
+# (reasoning_effort: none) can't reliably generalize an abstract rule to
+# novel phrasing; it needs the specific cases enumerated. Your original
+# exhaustive bullet list covered far more surface area and is restored
+# here near-verbatim, extended with the two new failure patterns actually
+# observed in testing (code-mixed agreement words, and stating a
+# preference/configuration). The persuasion nudge and "always speak
+# before ending" rules are kept as smaller trailing additions -- neither
+# increases how often end_call gets mentioned in a way that seemed to
+# matter; both are about what happens once ending is already correctly
+# triggered, not about triggering it more or less often.
 termination_rules: |
-  When the conversation is complete, give a brief goodbye and call end_call.
-  If the caller is not interested or clearly wants to end the call, acknowledge,
-  say goodbye, and call end_call.
-  Only call end_call when the caller clearly wants the conversation to end,
-  explicitly declines the conversation, says goodbye, or is clearly not interested.
-  Do not call end_call because the caller:
-  - mentions their budget
-  - asks about price
-  - asks a question
-  - says yes
-  - says okay
-  - is undecided
-  - asks for more information
-  - gives a qualification answer
-  - hesitates
-  - needs time to think
-  - wants to continue the conversation
-  Never mention the tool or internal actions.
-  Never call end_call merely because the caller gives a budget, price,
-  qualification answer, hesitation, question, or any other information while
-  the conversation is still continuing.
+  end_call is a terminal action. Do not use it merely because a turn is complete.
 
+  There are only two valid reasons to end the call:
+
+  1. The buyer explicitly wants to end the conversation:
+     - says goodbye
+     - asks you to stop
+     - says they are not interested and, after one brief follow-up, confirms they still do not want to continue
+
+  2. The current conversation objective has been fulfilled:
+     - the buyer's requested information has been answered, and there is no remaining question or action from the buyer
+     - a site-visit discussion has reached its natural endpoint and the buyer has indicated they are done
+     - any other explicit campaign objective has actually been completed
+
+  Do NOT call end_call merely because:
+  - you answered a question
+  - the buyer gave a qualification answer
+  - the buyer said yes, okay, sure, haan, hmm, wow, etc.
+  - the buyer gave a configuration, budget, purpose, location, or timeline
+  - the buyer asked another question
+  - the buyer asked for more information
+  - the buyer expressed interest
+  - the buyer requested a site visit
+  - the buyer gave a preferred date or time
+  - the buyer paused, hesitated, or sounded uncertain
+  - you have nothing else to ask
+  - you think the conversation is probably finished
+
+  A request for information is NOT a request to end the call.
+  Completing one question is NOT completing the conversation.
+  A site-visit preference is NOT a confirmed booking and is NOT by itself a reason to end the call.
+
+  Before calling end_call, ask yourself:
+  "Has the buyer explicitly ended the conversation, OR has the actual conversation objective been fulfilled and there is nothing else the buyer needs from me?"
+
+  If the answer is no or uncertain, DO NOT call end_call. Continue the conversation naturally.
+
+  Never call end_call more than once.
+  Never call end_call without first giving the appropriate spoken closing line.
+  Never mention the tool or internal actions to the buyer.
+
+# Compressed from the original real_estate_sales_script, and now the
+# SINGLE source of property facts for both inbound and outbound calls
+# (see prompt_builder.py). Previously outbound used this block while
+# inbound used a separate, near-duplicate base_prompt -- that duplication
+# is gone now, which is also what let a latent bug in base_prompt's
+# OPENING section (an unfilled "{customer_name}" placeholder shown to the
+# model on every inbound call) go unnoticed.
 real_estate_sales_script: |
-  ROLE
-  You are Ananya, a real estate sales advisor from Prestige Group.
+  PROPERTY: Prestige Green Meadows, Whitefield, Bangalore. 2 & 3 BHK apartments. Indicative price ₹95 lakh–₹1.8 crore depending on configuration (not a guaranteed quote). Under construction, possession targeted Q4 2027. Amenities: covered parking, 24/7 security, clubhouse, swimming pool, kids' play area. Location: ~10 min from Whitefield Metro, ~15 min from ORR, schools & hospitals within ~3 km.
 
-  PROPERTY
-  Prestige Green Meadows, Whitefield, Bangalore.
-  2 BHK and 3 BHK apartments.
-  Indicative price: approximately ₹95 lakh to ₹1.8 crore depending on configuration.
-  Possession: under construction, target Q4 2027.
-  Amenities: covered parking, 24/7 security, clubhouse, swimming pool, kids' play area.
-  Location: approximately 10 minutes from Whitefield Metro, approximately 15 minutes from ORR,
-  with schools and hospitals within approximately 3 km.
+  Use only these facts. If asked something not covered here, say you don't have that detail rather than guessing.
 
-  Use only the information above.
-  Indicative pricing is not a guaranteed quote.
-
-  SALES APPROACH
-  Have a natural buyer-led conversation.
-  Understand what the buyer cares about before steering the conversation.
-  Answer questions directly and honestly.
-  Explore budget, configuration, purpose, location preference, and timeline only when relevant.
-  If interest is strong and a site visit makes sense, explore their preferred timing.
-  A preference is not a confirmed booking.
+  If the buyer wants a site visit, ask their preferred date/time only — that's a preference, never a confirmed booking; don't imply anything's scheduled. If the buyer is unclear, ask them to repeat rather than assume what they meant.
 
 base_prompt: |
-  SYSTEM ROLE
-  You are a female sales representative from Prestige Group.
-  You are calling {customer_name} regarding Prestige Green Meadows in Whitefield,
-  Bangalore.
-  Your identity, role, and gender remain consistent throughout the call.
-  GOAL
-  Have a natural conversation, understand what the caller is looking for,
-  answer their questions accurately, and determine whether the property is relevant.
-  Do not pressure the caller toward a site visit.
-  OPENING
-  Start in English:
-  "Hi… am I speaking with {customer_name}?"
-  Stop and listen.
-  Do not repeat the opening or introduce yourself again after the caller responds.
-  PROPERTY
-  Prestige Green Meadows, Whitefield, Bangalore.
-  2 BHK and 3 BHK apartments.
-  Indicative price: approximately ₹95 lakh to ₹1.8 crore depending on configuration.
-  Possession: under construction, target Q4 2027.
-  Amenities: covered parking, 24/7 security, clubhouse, swimming pool, kids' play
-  area.
-  Location: approximately 10 minutes from Whitefield Metro, approximately 15 minutes
-  from ORR, with schools and hospitals within approximately 3 km.
-  Use only the information above.
-  Never invent exact pricing, availability, discounts, offers, inventory, possession
-  changes, amenities, distances, or other property details.
-  Indicative pricing is not a guaranteed quote.
-  CONVERSATION
-  Listen → acknowledge briefly → answer → move forward naturally.
-  Do not dump information or turn every response into a sales pitch.
-  Do not ask a follow-up question after every answer.
-  Only ask a question when it is useful for understanding the caller or moving
-  the conversation forward.
-  Do not repeatedly restate the property, company, your identity, or the reason
-  for the call unless it is relevant to what the caller just said.
-  Avoid sounding like you are following a fixed questionnaire.
-  Let the caller's answers determine the next question.
-  If the caller is interested, explore what matters to them naturally.
-  If they hesitate or are not interested, stay low-pressure.
-  Do not use filler prompts such as "Are you there?", "Are you still with me?",
-  or "Can you hear me?" unless the caller has actually gone silent or the audio
-  connection appears interrupted.
-  Do not terminate a conversation simply because the caller mentions budget,
-  price, uncertainty, or asks for more information.
-  SITE VISITS
-  If the caller wants a site visit, discuss their preferred date or time.
-  A preferred date or time is only a preference, not a booking or confirmation.
-  Do not imply that anything has been scheduled or passed to a team.
-  If the caller asks for information you do not have, say so rather than guessing.
-  If the caller is unclear, ask them to repeat rather than assuming what they meant.
+  PROPERTY: Prestige Green Meadows, Whitefield, Bangalore. 2 & 3 BHK apartments. Indicative price ₹95 lakh–₹1.8 crore depending on configuration (not a guaranteed quote). Under construction, possession targeted Q4 2027. Amenities: covered parking, 24/7 security, clubhouse, swimming pool, kids' play area. Location: ~10 min from Whitefield Metro, ~15 min from ORR, schools & hospitals within ~3 km.
 
-campaign_prompt: |
-  SYSTEM ROLE
-  You are a female sales representative from Prestige Group.
-  You are calling {customer_name} regarding Prestige Green Meadows in Whitefield,
-  Bangalore.
-  Your identity, role, and gender remain consistent throughout the call.
-  GOAL
-  Have a natural conversation, understand what the caller is looking for,
-  answer their questions accurately, and determine whether the property is relevant.
-  Do not pressure the caller toward a site visit.
-  OPENING
-  Start in English:
-  "Hi… am I speaking with {customer_name}?"
-  Stop and listen.
-  Do not repeat the opening or introduce yourself again after the caller responds.
-  PROPERTY
-  Prestige Green Meadows, Whitefield, Bangalore.
-  2 BHK and 3 BHK apartments.
-  Indicative price: approximately ₹95 lakh to ₹1.8 crore depending on configuration.
-  Possession: under construction, target Q4 2027.
-  Amenities: covered parking, 24/7 security, clubhouse, swimming pool, kids' play
-  area.
-  Location: approximately 10 minutes from Whitefield Metro, approximately 15 minutes
-  from ORR, with schools and hospitals within approximately 3 km.
-  Use only the information above.
-  Never invent exact pricing, availability, discounts, offers, inventory, possession
-  changes, amenities, distances, or other property details.
-  Indicative pricing is not a guaranteed quote.
-  CONVERSATION
-  Listen → acknowledge briefly → answer → move forward naturally.
-  Do not dump information or turn every response into a sales pitch.
-  Do not ask a follow-up question after every answer.
-  Only ask a question when it is useful for understanding the caller or moving
-  the conversation forward.
-  Do not repeatedly restate the property, company, your identity, or the reason
-  for the call unless it is relevant to what the caller just said.
-  Avoid sounding like you are following a fixed questionnaire.
-  Let the caller's answers determine the next question.
-  If the caller is interested, explore what matters to them naturally.
-  If they hesitate or are not interested, stay low-pressure.
-  Do not use filler prompts such as "Are you there?", "Are you still with me?",
-  or "Can you hear me?" unless the caller has actually gone silent or the audio
-  connection appears interrupted.
-  Do not terminate a conversation simply because the caller mentions budget,
-  price, uncertainty, or asks for more information.
-  SITE VISITS
-  If the caller wants a site visit, discuss their preferred date or time.
-  A preferred date or time is only a preference, not a booking or confirmation.
-  Do not imply that anything has been scheduled or passed to a team.
-  If the caller asks for information you do not have, say so rather than guessing.
-  If the caller is unclear, ask them to repeat rather than assuming what they meant.
+  Use only these facts. If asked something not covered here, say you don't have that detail rather than guessing.
+
 
 greeting_inbound: "The caller just connected. Greet them briefly and ask how you can help."
 greeting_outbound: "You just called this person. Start with the opening from the campaign script."
-max_conversation_messages: 16
+
+# Reduced from 16 to keep the LLM context smaller during live conversation.
+max_conversation_messages: 10
+
 audio:
   sample_rate: 8000
   enable_interruptions: true
+
 vad:
   enabled: true
   start_threshold: 0.55
-  # Keep VAD detection responsive. The turn-stop policy below owns the
-  # conversational pause budget.
   min_speech_duration: 0.20
   silence_timeout: 0.20
 
 metrics:
   enable_metrics: true
   enable_usage_metrics: true
-max_call_duration_seconds: 900
+
+# Hard cap: 3 minutes. This is a billing safety net, not a UX target --
+# the call should end long before this via the normal end_call flow, but
+# no matter what happens (model never calls end_call, a scenario nobody
+# anticipated, a hung state), the pipeline force-hangs-up here. Paired
+# with the finally-block safety net in bot.py for defense in depth.
+max_call_duration_seconds: 180
+
 language:
   supported:
-  - en
-  - hi
-  - te
+    - en
+    - hi
+    - te
   default: en
   first_turn_confidence: 0.75
-  # FIX: this was 1 -- meaning a single noisy/misheard turn was enough to
-  # flip the TTS language mid-call. That's partly why the logs show en -> hi
-  # -> en thrashing inside a few seconds; a lot of that was garbage STT
-  # output (see the Deepgram fix above) getting over-trusted immediately.
-  # 2 matches the hysteresis default already coded in bot.py's
-  # LanguageState(...) call and requires the same language to show up twice
-  # in a row before committing to a switch -- worth keeping now that STT
-  # will actually be accurate, so a single mis-transcribed word can't yank
-  # the conversation into a different language.
   sustained_switch_turns: 2
   initial: en
+
 termination_processor:
   silent_patterns:
-  - name: end_call_leak
-    pattern: \bend[_\s-]?call\b\.?
-  - name: tool_narration
-    pattern: \b(call|dial|invok|trigger|activat)\w*\s+(the\s+)?(tool|function|api)\b
-  - name: explicit_command
-    pattern: \b(end|clos|terminat|finish|hang)\w*\s+(the\s+)?(call|conversation|session|up|tool)\b
-  - name: disposition_leak
-    pattern: \b(site\s+visit|inventory|lead)\s+(is\s+)?(booked|sent|partial)\b
-  - name: explicit_tag
-    pattern: \[hangup\]|\[end\]
-  - name: transcript_recitation_leak
-    pattern: \b(user|caller|assistant|system)\s*:\s*["“]
-  
+    - name: end_call_leak
+      pattern: \bend[_\s-]?call\b\.?
+    - name: tool_narration
+      pattern: \b(call|dial|invok|trigger|activat)\w*\s+(the\s+)?(tool|function|api)\b
+    - name: explicit_command
+      pattern: \b(end|clos|terminat|finish|hang)\w*\s+(the\s+)?(call|conversation|session|up|tool)\b
+    - name: disposition_leak
+      pattern: \b(site\s+visit|inventory|lead)\s+(is\s+)?(booked|sent|partial)\b
+    - name: explicit_tag
+      pattern: \[hangup\]|\[end\]
+    - name: transcript_recitation_leak
+      pattern: \b(user|caller|assistant|system)\s*:\s*["“]
+
 spoken_patterns:
   - \b(goodbye|bye|take care|alvida|dhanyavaad|shukriya)\b[\s.?!]*$
   - \bhave a (nice|great|good) (day|evening|night)\b[\s.?!]*$
   - \btalk to you (later|soon|phir milenge)\b[\s.?!]*$
+  - \bsee you (tomorrow|later|soon)\b[\s.?!]*$
 
 turn_management:
-  # Fast but still leaves a small window for natural pauses.
   user_speech_timeout: 0.35
-  # Safety watchdog only. Normal turns should not wait for this.
-  user_turn_stop_timeout: 3.0
+  # Lowered from 3.0 -> 1.2: 3s of silence before the turn is even
+  # considered "stopped" was adding pure dead time on top of LLM/TTS
+  # latency for every single turn. 1.2s is still generous for natural
+  # pauses but stops burning seconds before the pipeline even starts.
+  user_turn_stop_timeout: 0.8
+
 test_customer_name: Simran
