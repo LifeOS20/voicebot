@@ -47,7 +47,17 @@ function base64ToFloat32Array(base64) {
 
 async function initCall() {
     statusText.innerText = "Requesting microphone permission...";
-    
+
+    // FIXED: nextPlayTime and activeSourceNodes are page-level variables
+    // that used to only ever get reset by a full page reload. Reconnecting
+    // (disconnect, then Connect again) within the same page load reuses
+    // whatever nextPlayTime the PREVIOUS call left behind, against a
+    // brand-new AudioContext whose currentTime resets back to 0 -- so the
+    // new call's first playAudio message can end up scheduled tens of
+    // seconds in the future and never audibly play until then.
+    nextPlayTime = 0;
+    activeSourceNodes = [];
+
     try {
         mediaStream = await navigator.mediaDevices.getUserMedia({
             audio: {
@@ -65,6 +75,23 @@ async function initCall() {
         if (audioContext.state === 'suspended') {
             await audioContext.resume();
         }
+
+        // NEW: some browsers leave the actual audio output device "cold"
+        // for a brief moment right after a freshly created/resumed
+        // AudioContext, even though currentTime is already ticking -- the
+        // very first real sound scheduled against it can be clipped or
+        // fully silent while the hardware spins up, while everything
+        // scheduled after that plays normally. The first thing this app
+        // ever plays is the bot's outbound greeting, so that's exactly
+        // the one utterance a cold-hardware hiccup would delete. Priming
+        // with a one-sample silent buffer here, before any real audio
+        // needs to render, forces the output device to actually start
+        // before the greeting arrives.
+        const warmupBuffer = audioContext.createBuffer(1, 1, audioContext.sampleRate);
+        const warmupSource = audioContext.createBufferSource();
+        warmupSource.buffer = warmupBuffer;
+        warmupSource.connect(audioContext.destination);
+        warmupSource.start(0);
         
         await audioContext.audioWorklet.addModule('audio-processor.js');
         const source = audioContext.createMediaStreamSource(mediaStream);

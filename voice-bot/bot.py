@@ -521,20 +521,72 @@ def _prune_history(messages: list, max_messages: int) -> None:
 
 
 class _SpokenTextGuard(FrameProcessor):
-    """Normalize typography and ensure contractions render cleanly for TTS."""
+    """
+    Normalizes text right before it reaches TTS so Sarvam speaks natural
+    language instead of literal symbols or single characters.
 
-    @staticmethod
-    def _text(frame: Frame) -> str:
-        value = getattr(frame, "text", None)
+    FIXED: this class used to contain a full copy of _TerminationProcessor's
+    process_frame body (interruption handling, farewell regex matching,
+    hangup scheduling) but never defined __init__, so every attribute it
+    touched (self.silent_termination_patterns, self._waiting_for_bot_stop,
+    self._hangup_task, ...) never existed on the instance. Every frame that
+    passed through it -- including the very first outbound greeting --
+    raised AttributeError, which is exactly the crash in the Sept 1 log
+    ('_SpokenTextGuard' object has no attribute 'silent_termination_
+    patterns'). Termination detection already runs correctly downstream
+    in _TerminationProcessor; it never belonged here, and duplicating it
+    here only broke things.
 
-        if isinstance(value, str):
-            return (
-                value
-                .replace("’", "'")
-                .replace("‘", "'")
-            )
+    This class now does what its docstring always claimed: normalize text
+    for speech. That's the direct fix for two production symptoms:
+      - Literal symbols read aloud ("greater than", "less than", "and")
+        when the LLM emits text like "18 < income < 25000" or "EMI & SIP".
+      - Fragmented, letter-by-letter speech: with every frame erroring out
+        above, TTS was getting an inconsistent, gappy stream of text
+        instead of clean, complete phrases. Fixing the crash restores a
+        normal flow of complete text into TTS's own chunking/buffering.
+    """
 
-        return ""
+    _REPLACEMENTS: list[tuple[re.Pattern, str]] = [
+        (re.compile(r"\s*>=\s*"), " at least "),
+        (re.compile(r"\s*<=\s*"), " at most "),
+        (re.compile(r"\s*>\s*"), " greater than "),
+        (re.compile(r"\s*<\s*"), " less than "),
+        (re.compile(r"\s*&\s*"), " and "),
+        (re.compile(r"\s*%\s*"), " percent "),
+        (re.compile(r"[*_`#]+"), ""),          # markdown emphasis/headers
+        (re.compile(r"[~^|]"), ""),
+        (re.compile(r"\s{2,}"), " "),
+    ]
+
+    @classmethod
+    def _normalize(cls, text: str) -> str:
+        text = (
+            text
+            .replace("’", "'")
+            .replace("‘", "'")
+            .replace("“", '"')
+            .replace("”", '"')
+            .replace("—", ", ")
+            .replace("–", " to ")
+        )
+
+        for pattern, replacement in cls._REPLACEMENTS:
+            text = pattern.sub(replacement, text)
+
+        # FIXED: this used to `return text.strip()`. The LLM streams its
+        # reply as a sequence of separate TextFrame deltas ("Hi", " Simran,",
+        # " this", " is", " Ananya", ...), and TTS's own downstream
+        # aggregator reassembles the full sentence by concatenating those
+        # deltas as-is. Stripping each delta's leading/trailing whitespace
+        # here deleted the space *between* every pair of chunks before they
+        # were ever glued back together -- producing exactly the run-on
+        # "HiSimran,thisisAnanyafromPrestigeGroup..." string that got sent
+        # to TTS and very likely garbled "Ananya" into "Anya" once the
+        # phonetic model had no word boundary left to find it with. Only
+        # the substitutions above should touch the text; the boundaries
+        # are not this processor's to remove.
+        return text
 
     async def process_frame(
         self,
@@ -547,16 +599,10 @@ class _SpokenTextGuard(FrameProcessor):
             direction == FrameDirection.DOWNSTREAM
             and isinstance(frame, (TextFrame, TTSSpeakFrame))
         ):
-            text = self._text(frame)
+            original = getattr(frame, "text", None)
 
-            if text == "":
-                return
-
-            if isinstance(frame, TextFrame):
-                frame.text = text
-
-            elif isinstance(frame, TTSSpeakFrame):
-                frame.text = text
+            if isinstance(original, str) and original:
+                frame.text = self._normalize(original)
 
         await self.push_frame(frame, direction)
 
@@ -582,6 +628,25 @@ class _InterruptionAudioGate(FrameProcessor):
     def next_generation(self) -> int:
         self._current_gen_id += 1
         self._is_interrupted = False
+
+        # FIXED: _active_playing_gen_id used to only get set when a
+        # TTSStartedFrame for the new generation arrived at this
+        # processor. Between the moment next_generation() bumped
+        # _current_gen_id and that TTSStartedFrame showing up, any real
+        # AudioRawFrame for the NEW generation that arrived first was
+        # compared against the OLD _active_playing_gen_id, failed the
+        # match, and got dropped as "stale" -- even though it was the
+        # brand-new utterance's own audio. This is provable from
+        # production logs: "Playing fresh utterance; purged 10 stale
+        # audio frames" fired 4ms after the very first TTS call of a
+        # call started generating, before any previous utterance existed
+        # to be stale from. On a cold pipeline this window is at its
+        # widest on the very first utterance of every call -- the
+        # outbound greeting. Setting _active_playing_gen_id here, not
+        # just on TTSStartedFrame, closes that window: a fresh generation
+        # is presumed current the moment it's declared, and the
+        # TTSStartedFrame handler below just reconfirms it.
+        self._active_playing_gen_id = self._current_gen_id
 
         return self._current_gen_id
 
@@ -827,6 +892,15 @@ class _TerminationProcessor(FrameProcessor):
         self._provider_hangup_sent = False
         self._waiting_for_bot_stop = False
         self._hangup_task: asyncio.Task | None = None
+        # NEW: safety_seconds was accepted and stored above but never used
+        # anywhere else in this class -- a safety net that was declared
+        # but never wired up. If BotStoppedSpeakingFrame never arrived
+        # (e.g. a frame-direction mismatch in this pipecat version), a
+        # detected farewell would set _waiting_for_bot_stop=True and then
+        # wait forever, which is exactly "the call wouldn't cut
+        # automatically, had to be done manually." This task is the
+        # actual backstop; see _run_safety_timeout below.
+        self._safety_task: asyncio.Task | None = None
 
         self._shutdown_state: dict[str, bool] = {}
         self._end_call_pending: dict[str, bool] = {}
@@ -873,15 +947,29 @@ class _TerminationProcessor(FrameProcessor):
         ]
 
         self.spoken_termination_patterns = [
-            re.compile(r"\b(goodbye|bye|good day|take care)\b", re.IGNORECASE),
-            re.compile(r"\bhave a (nice|great|good|wonderful) (day|evening|night)\b", re.IGNORECASE),
-            re.compile(r"\btalk to you (later|soon)\b", re.IGNORECASE),
-            re.compile(r"\bthank(s| you) for your time\b", re.IGNORECASE),
-            re.compile(r"\bsee you (tomorrow|soon|then|there)\b", re.IGNORECASE),
-            re.compile(r"\byou'?re welcome\b.*\b(bye|goodbye|see you|take care)\b", re.IGNORECASE),
-            re.compile(r"\blook(ing)? forward to (seeing|meeting) you\b", re.IGNORECASE),
+            re.compile(
+                r"\b(goodbye|bye|good day|take care)\b",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"\bhave a (nice|great|good) "
+                r"(day|evening|night)\b",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"\btalk to you (later|soon)\b",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"\bthank you for your time\b",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"\bthanks for your time\b",
+                re.IGNORECASE,
+            ),
         ]
-        
+
     def bind_state(
         self,
         *,
@@ -930,6 +1018,38 @@ class _TerminationProcessor(FrameProcessor):
         except asyncio.CancelledError:
             return
 
+    async def _run_safety_timeout(self) -> None:
+        """
+        NEW: backstop for when the normal BotStoppedSpeakingFrame-triggered
+        hangup never fires. self._safety_seconds existed as a constructor
+        param before this fix but was never read anywhere -- this is what
+        actually wires it up. Without this, a missed or mis-ordered
+        BotStoppedSpeakingFrame left the call connected indefinitely after
+        a farewell, requiring a manual hangup.
+        """
+        try:
+            await asyncio.sleep(self._safety_seconds)
+        except asyncio.CancelledError:
+            return
+
+        if self._provider_hangup_sent:
+            return
+
+        logger.warning(
+            "[{}] Farewell safety timeout ({}s) -- BotStoppedSpeakingFrame "
+            "never arrived; forcing hangup anyway",
+            self._stream_id,
+            self._safety_seconds,
+        )
+
+        await self._force_hangup_fn("termination_safety_timeout")
+        self._provider_hangup_sent = True
+
+        await self.push_frame(
+            EndTaskFrame(),
+            FrameDirection.UPSTREAM,
+        )
+
     async def process_frame(
         self,
         frame: Frame,
@@ -950,6 +1070,14 @@ class _TerminationProcessor(FrameProcessor):
                 self._hangup_task.cancel()
 
             self._hangup_task = None
+
+            if (
+                self._safety_task
+                and not self._safety_task.done()
+            ):
+                self._safety_task.cancel()
+
+            self._safety_task = None
             self._termination_requested = False
             self._provider_hangup_sent = False
 
@@ -1012,6 +1140,19 @@ class _TerminationProcessor(FrameProcessor):
                 self._waiting_for_bot_stop = True
                 self._shutdown_state["active"] = True
 
+                # NEW: arm the safety-timeout backstop the moment we start
+                # waiting for BotStoppedSpeakingFrame. See _run_safety_
+                # timeout for why this exists.
+                if (
+                    self._safety_task
+                    and not self._safety_task.done()
+                ):
+                    self._safety_task.cancel()
+
+                self._safety_task = asyncio.create_task(
+                    self._run_safety_timeout()
+                )
+
                 logger.info(
                     "[{}] Farewell detected; will hang up after bot stops speaking",
                     self._stream_id,
@@ -1030,10 +1171,21 @@ class _TerminationProcessor(FrameProcessor):
             return
 
         # Once the farewell has actually finished playing, hang up.
-        if (
-            direction == FrameDirection.UPSTREAM
-            and isinstance(frame, BotStoppedSpeakingFrame)
-        ):
+        #
+        # FIXED: was gated on `direction == FrameDirection.UPSTREAM`. In
+        # this same file, _SilenceChecker deliberately does NOT direction-
+        # filter Bot(Started|Stopped)SpeakingFrame (see its own comment on
+        # why direction filtering broke UserStartedSpeakingFrame handling
+        # nearby) -- two processors in the same pipeline making opposite
+        # assumptions about which direction this exact frame type travels
+        # is the actual root cause of the flakiness reported after the
+        # ChatGPT patch: removing the direction check "fixed" the hangup
+        # in one run and skipped it in another, because it was never
+        # verified which way this frame actually flows in this pipecat
+        # version. Matching on frame type alone, regardless of direction,
+        # removes that guesswork; the _safety_task above is the backstop
+        # if this still somehow doesn't fire.
+        if isinstance(frame, BotStoppedSpeakingFrame):
             if (
                 self._waiting_for_bot_stop
                 and not self._hangup_task
@@ -1043,6 +1195,14 @@ class _TerminationProcessor(FrameProcessor):
                     self._stream_id,
                     self._grace_seconds,
                 )
+
+                if (
+                    self._safety_task
+                    and not self._safety_task.done()
+                ):
+                    self._safety_task.cancel()
+
+                self._safety_task = None
 
                 self._hangup_task = asyncio.create_task(
                     self._hangup_after_bot_stop()
@@ -1697,6 +1857,16 @@ async def run_bot(
             the request content, not which client object sent it, so this
             is functionally equivalent to reusing the internal client and
             can't break again the same way if pipecat's internals change.
+
+            FIXED: warm_kwargs previously sent messages=[system] with no
+            user-role message. Groq's chat template requires at least one
+            user message to render at all -- see the openai.BadRequestError
+            in the Sept 1 log ("failed to render text output: ... raise_
+            exception: No user query found in messages"). That 400 fired
+            on every single call, meaning this pre-warm has never once
+            succeeded. Adding a short, inert placeholder user message
+            fixes the request shape; it costs nothing extra since
+            max_tokens=1 discards the completion anyway.
             """
             try:
                 model = (
@@ -1711,6 +1881,7 @@ async def run_bot(
                     "model": model,
                     "messages": [
                         {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": "Hello"},
                     ],
                     "max_tokens": 1,
                 }
